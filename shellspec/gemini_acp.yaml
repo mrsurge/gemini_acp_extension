@@ -1,0 +1,31 @@
+version: "1"
+shells:
+  gemini_acp:
+    backend: pipe
+    pipe:
+      mode: native_pipe_testing
+    cwd: ${CWD}
+    subgroups: ["codex_agent", "acp", "gemini"]
+    inspect_hints:
+      - json
+      - jsonrpc
+    command:
+      - gemini
+      - --acp
+    labels:
+      app: "gemini-acp"
+  gemini_acp_observed:
+    backend: pipe
+    pipe:
+      mode: native_pipe_testing
+    cwd: ${CWD}
+    subgroups: ["codex_agent", "acp", "gemini", "observed"]
+    inspect_hints:
+      - json
+      - jsonrpc
+    command:
+      - gemini
+      - --acp
+    labels:
+      app: "gemini-acp-observed"
+      conversation_id: ${CONVERSATION_ID}

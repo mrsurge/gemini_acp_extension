@@ -1,0 +1,15 @@
+{
+  "include": [
+    "__init__.py",
+    "bridge_client.py",
+    "client.py",
+    "dependencies.py",
+    "router.py",
+    "transport.py",
+    "vendor_sdk.py"
+  ],
+  "exclude": ["_vendor"],
+  "extraPaths": ["_vendor/python-sdk/src"],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "standard"
+}

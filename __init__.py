@@ -1,0 +1,1 @@
+"""Gemini ACP extension skeleton."""

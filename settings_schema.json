@@ -1,0 +1,49 @@
+{
+  "version": "1",
+  "description": "Settings schema for the Gemini ACP scaffold",
+  "fields": [
+    {
+      "id": "cwd",
+      "type": "path",
+      "label": "Working Directory",
+      "placeholder": "~/project",
+      "default": "~",
+      "required": true,
+      "browse": true
+    },
+    {
+      "id": "model",
+      "type": "select",
+      "label": "Model",
+      "options": [
+        {"value": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+        {"value": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"}
+      ],
+      "default": "gemini-2.5-pro"
+    },
+    {
+      "id": "approval_mode",
+      "type": "select",
+      "label": "Permission Mode",
+      "options": [
+        {"value": "cancel", "label": "Cancel all requests"},
+        {"value": "auto-approve", "label": "Auto-approve first allow option"}
+      ],
+      "default": "cancel"
+    },
+    {
+      "id": "developer_instructions",
+      "type": "textarea",
+      "label": "Developer Instructions",
+      "placeholder": "Reserved for future Gemini ACP prompt/session wiring",
+      "rows": 6,
+      "default": ""
+    },
+    {
+      "id": "debug_trace",
+      "type": "checkbox",
+      "label": "Internal Debug Trace",
+      "default": false
+    }
+  ]
+}

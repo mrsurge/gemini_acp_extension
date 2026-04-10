@@ -1,0 +1,36 @@
+{
+  "id": "gemini-acp",
+  "name": "Gemini ACP",
+  "version": "0.1.0",
+  "type": "gemini_acp",
+  "description": "Gemini ACP scaffold extension for multi-root loader testing.",
+  "enabled": true,
+  "agent": {
+    "command": "gemini",
+    "args": ["--acp"],
+    "shellspec": "shellspec/gemini_acp.yaml#gemini_acp_observed"
+  },
+  "capabilities": {
+    "sessionResume": false,
+    "streaming": false,
+    "modelListing": false,
+    "permissionHandling": true,
+    "hasPlan": false,
+    "hasTodo": false,
+    "hasPlanModes": false
+  },
+  "dependencies": {
+    "has_check": true,
+    "has_install": false
+  },
+  "model": {
+    "name": "gemini-2.5-pro",
+    "provider": "google"
+  },
+  "ui": {
+    "color": "#4285f4",
+    "semanticShellRibbon": {
+      "quoteParsing": false
+    }
+  }
+}
