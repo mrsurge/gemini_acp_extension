@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .dependencies import check_dependencies
-from .router import build_history_transcript_entries, build_prompt_turn_output, build_user_turn_output, utc_ts
+from .router import GeminiLiveTurnAccumulator, build_history_transcript_entries, build_user_turn_output, utc_ts
 from .transport import GeminiACPTransport
 
 _broadcast_fn: Optional[Callable[..., Any]] = None
@@ -260,6 +260,17 @@ async def handle_message(
         for event in user_events:
             if isinstance(event, dict):
                 await _broadcast_fn(event)
+    turn_accumulator = GeminiLiveTurnAccumulator(
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+
+    async def _handle_live_update(payload: Dict[str, Any]) -> None:
+        events = turn_accumulator.consume_live_update(payload)
+        if callable(_broadcast_fn):
+            for event in events:
+                await _broadcast_fn(event)
+
     try:
         prompt_result = await transport.send_prompt(
             conversation_id=conversation_id,
@@ -269,6 +280,7 @@ async def handle_message(
             model=str(merged_settings.get("model") or "").strip() or None,
             message_id=user_message_id,
             existing_session_id=existing_session_id,
+            on_update=_handle_live_update,
         )
     except Exception as exc:
         message = f"Gemini ACP send failed: {exc}"
@@ -294,13 +306,12 @@ async def handle_message(
         _save_meta(conversation_id, meta)
         return {"ok": False, "error": str(exc), "restore_draft": True}
 
-    routed = build_prompt_turn_output(
-        conversation_id=conversation_id,
-        session_id=prompt_result.session_id,
-        turn_id=turn_id,
-        updates=prompt_result.updates,
+    if not turn_accumulator.has_content():
+        turn_accumulator.consume_batch_updates(prompt_result.updates)
+    routed = turn_accumulator.finalize(
         stop_reason=prompt_result.stop_reason,
         debug_trace=debug_trace,
+        updates=prompt_result.updates,
     )
     transcript_entries = routed.get("transcript_entries")
     if callable(_transcript_fn) and isinstance(transcript_entries, list):

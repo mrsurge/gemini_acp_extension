@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,9 @@ class GeminiPromptResult:
     usage: Optional[dict[str, Any]]
     updates: list[dict[str, Any]]
     user_message_id: Optional[str] = None
+
+
+LiveUpdateCallback = Callable[[dict[str, Any]], Any]
 
 
 def _field_value(value: Any, *names: str) -> Any:
@@ -351,6 +355,10 @@ class GeminiACPTransport:
         self._model_options_by_conversation: dict[str, list[dict[str, Any]]] = {}
         self._current_model_by_conversation: dict[str, str] = {}
         self._agent_capabilities: Any = None
+        self._capture_mode_by_conversation: dict[str, str] = {}
+        self._live_update_callbacks: dict[str, LiveUpdateCallback] = {}
+        self._live_update_tasks: dict[str, set[asyncio.Task[None]]] = {}
+        self._suppressed_update_counts: dict[str, int] = {}
         self._suppressed_history_updates: set[str] = set()
 
     def is_ready(self) -> bool:
@@ -399,6 +407,10 @@ class GeminiACPTransport:
             self._model_options_by_conversation.clear()
             self._current_model_by_conversation.clear()
             self._agent_capabilities = None
+            self._capture_mode_by_conversation.clear()
+            self._live_update_callbacks.clear()
+            self._live_update_tasks.clear()
+            self._suppressed_update_counts.clear()
             self._suppressed_history_updates.clear()
             if shell_id:
                 mgr = await self._fws_getter()
@@ -453,6 +465,61 @@ class GeminiACPTransport:
             return
         self._conversation_by_session[session_id] = conversation_id
 
+    def _set_capture_mode(self, conversation_id: str, mode: Optional[str]) -> None:
+        if mode:
+            self._capture_mode_by_conversation[conversation_id] = mode
+            return
+        self._capture_mode_by_conversation.pop(conversation_id, None)
+
+    def _dispatch_live_update(self, conversation_id: str, payload: dict[str, Any]) -> None:
+        callback = self._live_update_callbacks.get(conversation_id)
+        if callback is None:
+            return
+
+        async def _runner() -> None:
+            result = callback(dict(payload))
+            if inspect.isawaitable(result):
+                await result
+
+        task = asyncio.create_task(_runner(), name=f"gemini-acp-live-update-{conversation_id[:8]}")
+        task_set = self._live_update_tasks.setdefault(conversation_id, set())
+        task_set.add(task)
+
+        def _discard(done_task: asyncio.Task[None]) -> None:
+            task_set.discard(done_task)
+            if not task_set:
+                self._live_update_tasks.pop(conversation_id, None)
+
+        task.add_done_callback(_discard)
+
+    async def _wait_for_live_update_tasks(self, conversation_id: str) -> None:
+        while True:
+            pending = tuple(self._live_update_tasks.get(conversation_id, ()))
+            if not pending:
+                return
+            await asyncio.gather(*pending)
+
+    async def _wait_for_count_quiescence(
+        self,
+        conversation_id: str,
+        *,
+        count_getter: Callable[[str], int],
+        stable_iterations: int = 3,
+        max_iterations: int = 12,
+    ) -> None:
+        stable = 0
+        last_count = count_getter(conversation_id)
+        for _ in range(max_iterations):
+            await asyncio.sleep(0)
+            current_count = count_getter(conversation_id)
+            if current_count == last_count:
+                stable += 1
+                if stable >= stable_iterations:
+                    return
+                continue
+            stable = 0
+            last_count = current_count
+
     async def _apply_model_selection(
         self,
         *,
@@ -505,14 +572,15 @@ class GeminiACPTransport:
         self._remember_session_binding(conversation_id, session_id)
         bind_response: Any = None
         resume_error: Optional[Exception] = None
-        try:
-            bind_response = await self._connection.resume_session(
-                cwd=cwd,
-                session_id=session_id,
-                mcp_servers=[],
-            )
-        except Exception as exc:
-            resume_error = exc
+        if self.supports_resume_session():
+            try:
+                bind_response = await self._connection.resume_session(
+                    cwd=cwd,
+                    session_id=session_id,
+                    mcp_servers=[],
+                )
+            except Exception as exc:
+                resume_error = exc
         if bind_response is None:
             try:
                 bind_response = await self._connection.load_session(
@@ -551,16 +619,19 @@ class GeminiACPTransport:
         self._route_session_to_conversation(conversation_id, session_id)
         bind_response: Any = None
         resume_error: Optional[Exception] = None
+        self._set_capture_mode(conversation_id, "suppress")
+        self._suppressed_update_counts[conversation_id] = 0
         self._suppressed_history_updates.add(conversation_id)
         try:
-            try:
-                bind_response = await self._connection.resume_session(
-                    cwd=cwd,
-                    session_id=session_id,
-                    mcp_servers=[],
-                )
-            except Exception as exc:
-                resume_error = exc
+            if self.supports_resume_session():
+                try:
+                    bind_response = await self._connection.resume_session(
+                        cwd=cwd,
+                        session_id=session_id,
+                        mcp_servers=[],
+                    )
+                except Exception as exc:
+                    resume_error = exc
             if bind_response is None:
                 try:
                     bind_response = await self._connection.load_session(
@@ -574,7 +645,13 @@ class GeminiACPTransport:
                             f"Gemini ACP session resume failed: {resume_error}; session load fallback also failed: {exc}"
                         ) from exc
                     raise RuntimeError(f"Gemini ACP session load failed: {exc}") from exc
+            await self._wait_for_count_quiescence(
+                conversation_id,
+                count_getter=lambda cid: self._suppressed_update_counts.get(cid, 0),
+            )
         finally:
+            self._set_capture_mode(conversation_id, None)
+            self._suppressed_update_counts.pop(conversation_id, None)
             self._suppressed_history_updates.discard(conversation_id)
         self._remember_session_binding(conversation_id, session_id)
         self._remember_session_configuration(
@@ -596,10 +673,17 @@ class GeminiACPTransport:
         session_id: str,
         text: str,
         message_id: Optional[str],
+        on_update: Optional[LiveUpdateCallback] = None,
     ) -> GeminiPromptResult:
         if self._connection is None:
             raise RuntimeError("Gemini ACP connection not initialized")
         self._updates_by_conversation[conversation_id] = []
+        self._set_capture_mode(conversation_id, "prompt")
+        self._live_update_tasks.pop(conversation_id, None)
+        if on_update is not None:
+            self._live_update_callbacks[conversation_id] = on_update
+        else:
+            self._live_update_callbacks.pop(conversation_id, None)
         try:
             response = await self._connection.prompt(
                 session_id=session_id,
@@ -607,8 +691,17 @@ class GeminiACPTransport:
                 message_id=message_id,
             )
         except Exception:
+            self._live_update_callbacks.pop(conversation_id, None)
+            self._set_capture_mode(conversation_id, None)
             self._updates_by_conversation.pop(conversation_id, None)
             raise
+        await self._wait_for_count_quiescence(
+            conversation_id,
+            count_getter=lambda cid: len(self._updates_by_conversation.get(cid, [])),
+        )
+        await self._wait_for_live_update_tasks(conversation_id)
+        self._live_update_callbacks.pop(conversation_id, None)
+        self._set_capture_mode(conversation_id, None)
         updates = list(self._updates_by_conversation.pop(conversation_id, []))
         self._remember_session_configuration(
             conversation_id,
@@ -756,6 +849,7 @@ class GeminiACPTransport:
                 raise RuntimeError("Gemini ACP connection not initialized")
             self._remember_session_binding(conversation_id, session_id)
             self._updates_by_conversation[conversation_id] = []
+            self._set_capture_mode(conversation_id, "history")
             try:
                 response = await self._connection.load_session(
                     cwd=cwd,
@@ -763,8 +857,14 @@ class GeminiACPTransport:
                     mcp_servers=[],
                 )
             except Exception:
+                self._set_capture_mode(conversation_id, None)
                 self._updates_by_conversation.pop(conversation_id, None)
                 raise
+            await self._wait_for_count_quiescence(
+                conversation_id,
+                count_getter=lambda cid: len(self._updates_by_conversation.get(cid, [])),
+            )
+            self._set_capture_mode(conversation_id, None)
             updates = list(self._updates_by_conversation.pop(conversation_id, []))
             self._remember_session_configuration(
                 conversation_id,
@@ -783,6 +883,7 @@ class GeminiACPTransport:
         model: Optional[str] = None,
         message_id: Optional[str] = None,
         existing_session_id: Optional[str] = None,
+        on_update: Optional[LiveUpdateCallback] = None,
     ) -> GeminiPromptResult:
         await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
         async with self._lock:
@@ -816,6 +917,7 @@ class GeminiACPTransport:
                     session_id=session_id,
                     text=text,
                     message_id=message_id,
+                    on_update=on_update,
                 )
             except Exception as exc:
                 if not (cold_bound_session and bound_session_id and _looks_like_cold_session_error(exc)):
@@ -832,6 +934,7 @@ class GeminiACPTransport:
                     session_id=resumed_session_id,
                     text=text,
                     message_id=message_id,
+                    on_update=on_update,
                 )
             else:
                 if cold_bound_session and bound_session_id:
@@ -854,13 +957,17 @@ class GeminiACPTransport:
                 conversation_id,
                 config_options=payload.get("configOptions"),
             )
-        if conversation_id in self._suppressed_history_updates and kind in {
-            "user_message_chunk",
-            "agent_message_chunk",
-            "agent_thought_chunk",
-        }:
+        capture_mode = self._capture_mode_by_conversation.get(conversation_id)
+        if capture_mode == "suppress":
+            self._suppressed_update_counts[conversation_id] = self._suppressed_update_counts.get(conversation_id, 0) + 1
             return
-        self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
+        if capture_mode == "history":
+            self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
+            return
+        if capture_mode == "prompt":
+            self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
+            self._dispatch_live_update(conversation_id, payload)
+            return
 
     async def _close_connection(self) -> None:
         if self._connection is not None:
@@ -869,6 +976,10 @@ class GeminiACPTransport:
         self._connection = None
         self._client = None
         self._agent_capabilities = None
+        self._capture_mode_by_conversation.clear()
+        self._live_update_callbacks.clear()
+        self._live_update_tasks.clear()
+        self._suppressed_update_counts.clear()
         bridge = self._bridge
         self._bridge = None
         if bridge is not None:
@@ -962,6 +1073,10 @@ class GeminiACPTransport:
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
         self._agent_capabilities = None
+        self._capture_mode_by_conversation.clear()
+        self._live_update_callbacks.clear()
+        self._live_update_tasks.clear()
+        self._suppressed_update_counts.clear()
         self._suppressed_history_updates.clear()
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
@@ -981,4 +1096,8 @@ class GeminiACPTransport:
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
         self._agent_capabilities = None
+        self._capture_mode_by_conversation.clear()
+        self._live_update_callbacks.clear()
+        self._live_update_tasks.clear()
+        self._suppressed_update_counts.clear()
         self._suppressed_history_updates.clear()

@@ -124,6 +124,121 @@ def _collect_assistant_messages(updates: List[Dict[str, Any]]) -> List[Dict[str,
     return [item for item in _collect_message_updates(updates) if item.get("role") == "assistant"]
 
 
+class GeminiLiveTurnAccumulator:
+    def __init__(self, *, conversation_id: str, turn_id: str) -> None:
+        self.conversation_id = conversation_id
+        self.turn_id = turn_id
+        self.assistant_id = f"{turn_id}:assistant"
+        self.reasoning_id = f"{turn_id}:reasoning"
+        self._assistant_parts: List[str] = []
+        self._reasoning_parts: List[str] = []
+
+    def _consume_payload(self, payload: Dict[str, Any], *, emit_live: bool) -> List[Dict[str, Any]]:
+        kind = _session_update_kind(payload)
+        text = _content_text(payload.get("content"))
+        if not text:
+            return []
+        if kind == "agent_message_chunk":
+            self._assistant_parts.append(text)
+            if not emit_live:
+                return []
+            return [{
+                "type": "assistant_delta",
+                "conversation_id": self.conversation_id,
+                "turn_id": self.turn_id,
+                "id": self.assistant_id,
+                "delta": text,
+            }]
+        if kind == "agent_thought_chunk":
+            self._reasoning_parts.append(text)
+            if not emit_live:
+                return []
+            return [{
+                "type": "reasoning_delta",
+                "conversation_id": self.conversation_id,
+                "turn_id": self.turn_id,
+                "id": self.reasoning_id,
+                "delta": text,
+            }]
+        return []
+
+    def consume_live_update(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return self._consume_payload(payload, emit_live=True)
+
+    def consume_batch_updates(self, updates: List[Dict[str, Any]]) -> None:
+        for payload in updates:
+            self._consume_payload(payload, emit_live=False)
+
+    def has_content(self) -> bool:
+        return bool(self._assistant_parts or self._reasoning_parts)
+
+    def finalize(
+        self,
+        *,
+        stop_reason: str,
+        debug_trace: bool = False,
+        updates: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        events: List[Dict[str, Any]] = []
+        transcript_entries: List[Dict[str, Any]] = []
+
+        reasoning_text = "".join(self._reasoning_parts).strip()
+        if reasoning_text:
+            events.append({
+                "type": "reasoning_finalize",
+                "conversation_id": self.conversation_id,
+                "turn_id": self.turn_id,
+                "id": self.reasoning_id,
+                "text": reasoning_text,
+            })
+            transcript_entries.append(
+                _build_message_transcript_entry(
+                    turn_id=self.turn_id,
+                    message_id=self.reasoning_id,
+                    role="reasoning",
+                    text=reasoning_text,
+                )
+            )
+
+        assistant_text = "".join(self._assistant_parts).strip()
+        if assistant_text:
+            events.append({
+                "type": "assistant_finalize",
+                "conversation_id": self.conversation_id,
+                "turn_id": self.turn_id,
+                "id": self.assistant_id,
+                "text": assistant_text,
+            })
+            transcript_entries.append(
+                _build_message_transcript_entry(
+                    turn_id=self.turn_id,
+                    message_id=self.assistant_id,
+                    role="assistant",
+                    text=assistant_text,
+                )
+            )
+
+        warning_event = _warning_for_stop_reason(
+            conversation_id=self.conversation_id,
+            turn_id=self.turn_id,
+            stop_reason=stop_reason,
+        )
+        if warning_event is not None:
+            events.append(warning_event)
+
+        if debug_trace and isinstance(updates, list):
+            transcript_entries.extend(_debug_trace_entries(
+                conversation_id=self.conversation_id,
+                turn_id=self.turn_id,
+                updates=updates,
+            ))
+
+        return {
+            "events": events,
+            "transcript_entries": transcript_entries,
+        }
+
+
 def _debug_trace_entries(
     *,
     conversation_id: str,
@@ -211,49 +326,17 @@ def build_prompt_turn_output(
     stop_reason: str,
     debug_trace: bool = False,
 ) -> Dict[str, Any]:
-    events: List[Dict[str, Any]] = []
-    transcript_entries: List[Dict[str, Any]] = []
-
-    for index, message in enumerate(_collect_assistant_messages(updates), start=1):
-        text = message.get("text", "").strip()
-        if not text:
-            continue
-        message_id = message.get("message_id") or f"{session_id}:{turn_id}:assistant:{index}"
-        events.append({
-            "type": "assistant_finalize",
-            "conversation_id": conversation_id,
-            "id": message_id,
-            "text": text,
-            "turn_id": turn_id,
-        })
-        transcript_entries.append(
-            _build_message_transcript_entry(
-                turn_id=turn_id,
-                message_id=message_id,
-                role="assistant",
-                text=text,
-            )
-        )
-
-    warning_event = _warning_for_stop_reason(
+    del session_id
+    accumulator = GeminiLiveTurnAccumulator(
         conversation_id=conversation_id,
         turn_id=turn_id,
-        stop_reason=stop_reason,
     )
-    if warning_event is not None:
-        events.append(warning_event)
-
-    if debug_trace:
-        transcript_entries.extend(_debug_trace_entries(
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-            updates=updates,
-        ))
-
-    return {
-        "events": events,
-        "transcript_entries": transcript_entries,
-    }
+    accumulator.consume_batch_updates(updates)
+    return accumulator.finalize(
+        stop_reason=stop_reason,
+        debug_trace=debug_trace,
+        updates=updates,
+    )
 
 
 def build_history_transcript_entries(
