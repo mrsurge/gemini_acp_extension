@@ -10,6 +10,41 @@ def utc_ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _build_message_event(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    message_id: str,
+    role: str,
+    text: str,
+) -> Dict[str, Any]:
+    return {
+        "type": "message",
+        "conversation_id": conversation_id,
+        "turn_id": turn_id,
+        "id": message_id,
+        "role": role,
+        "text": text,
+    }
+
+
+def _build_message_transcript_entry(
+    *,
+    turn_id: str,
+    message_id: str,
+    role: str,
+    text: str,
+) -> Dict[str, Any]:
+    return {
+        "role": role,
+        "id": message_id,
+        "item_id": message_id,
+        "text": text,
+        "timestamp": utc_ts(),
+        "turn_id": turn_id,
+    }
+
+
 def _session_update_kind(payload: Dict[str, Any]) -> str:
     raw = payload.get("sessionUpdate")
     if isinstance(raw, str) and raw.strip():
@@ -113,6 +148,37 @@ def _warning_for_stop_reason(
     }
 
 
+def build_user_turn_output(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    user_message_id: str,
+    text: str,
+) -> Dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        return {"events": [], "transcript_entries": []}
+    return {
+        "events": [
+            _build_message_event(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                message_id=user_message_id,
+                role="user",
+                text=stripped,
+            ),
+        ],
+        "transcript_entries": [
+            _build_message_transcript_entry(
+                turn_id=turn_id,
+                message_id=user_message_id,
+                role="user",
+                text=stripped,
+            ),
+        ],
+    }
+
+
 def build_prompt_turn_output(
     *,
     conversation_id: str,
@@ -137,13 +203,14 @@ def build_prompt_turn_output(
             "text": text,
             "turn_id": turn_id,
         })
-        transcript_entries.append({
-            "role": "assistant",
-            "id": message_id,
-            "text": text,
-            "timestamp": utc_ts(),
-            "turn_id": turn_id,
-        })
+        transcript_entries.append(
+            _build_message_transcript_entry(
+                turn_id=turn_id,
+                message_id=message_id,
+                role="assistant",
+                text=text,
+            )
+        )
 
     warning_event = _warning_for_stop_reason(
         conversation_id=conversation_id,

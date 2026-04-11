@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .dependencies import check_dependencies
-from .router import build_prompt_turn_output, utc_ts
+from .router import build_prompt_turn_output, build_user_turn_output, utc_ts
 from .transport import GeminiACPTransport
 
 _broadcast_fn: Optional[Callable[..., Any]] = None
@@ -113,7 +114,9 @@ def _normalize_sandbox_policy(settings: Dict[str, Any]) -> str:
 
 async def get_settings_schema(extension_id: str) -> Dict[str, Any]:
     del extension_id
-    return json.loads(_settings_schema_path().read_text(encoding="utf-8"))
+    schema = json.loads(_settings_schema_path().read_text(encoding="utf-8"))
+    schema["cache"] = "none"
+    return schema
 
 
 async def get_splash_schema(extension_id: str) -> Dict[str, Any]:
@@ -146,19 +149,23 @@ async def get_runtime_options(
 
 
 async def list_models() -> List[Dict[str, Any]]:
-    schema = await get_settings_schema("gemini-acp")
-    fields_obj = schema.get("fields") if isinstance(schema, dict) else []
-    fields = fields_obj if isinstance(fields_obj, list) else []
-    for field in fields:
-        if isinstance(field, dict) and field.get("id") == "model":
-            options_obj = field.get("options")
-            options = options_obj if isinstance(options_obj, list) else []
-            return [
-                {"id": option.get("value", ""), "displayName": option.get("label", option.get("value", ""))}
-                for option in options
-                if isinstance(option, dict)
-            ]
-    return []
+    transport = _transport
+    if transport is None:
+        return []
+    try:
+        models = await transport.list_models(cwd=str(Path.home()))
+        return [
+            {
+                "id": str(model.get("id") or ""),
+                "name": str(model.get("name") or model.get("id") or ""),
+                "description": str(model.get("description") or ""),
+            }
+            for model in models
+            if isinstance(model, dict) and str(model.get("id") or "").strip()
+        ]
+    except Exception as exc:
+        print(f"[GeminiACP] list_models failed: {exc}")
+        return []
 
 
 async def warm_up_all_extensions(timeout: float = 60.0) -> Dict[str, bool]:
@@ -215,13 +222,32 @@ async def handle_message(
     turn_counter = turn_counter_raw if isinstance(turn_counter_raw, int) else 0
     turn_counter += 1
     turn_id = f"gemini_turn_{turn_counter}"
+    user_message_id = str(uuid.uuid4())
     meta["gemini_acp_turn_counter"] = turn_counter
+    user_turn_output = build_user_turn_output(
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        user_message_id=user_message_id,
+        text=text,
+    )
+    user_transcript_entries = user_turn_output.get("transcript_entries")
+    if callable(_transcript_fn) and isinstance(user_transcript_entries, list):
+        for entry in user_transcript_entries:
+            if isinstance(entry, dict):
+                await _transcript_fn(conversation_id, entry)
+    user_events = user_turn_output.get("events")
+    if callable(_broadcast_fn) and isinstance(user_events, list):
+        for event in user_events:
+            if isinstance(event, dict):
+                await _broadcast_fn(event)
     try:
         prompt_result = await transport.send_prompt(
             conversation_id=conversation_id,
             text=text,
             cwd=cwd,
             approval_policy=approval_policy,
+            model=str(merged_settings.get("model") or "").strip() or None,
+            message_id=user_message_id,
         )
     except Exception as exc:
         message = f"Gemini ACP send failed: {exc}"
@@ -272,6 +298,7 @@ async def handle_message(
     meta["gemini_acp_session_id"] = prompt_result.session_id
     meta["gemini_acp_shell_id"] = transport.runtime_instance_id()
     meta["gemini_acp_last_stop_reason"] = prompt_result.stop_reason
+    meta["gemini_acp_last_user_message_id"] = prompt_result.user_message_id or user_message_id
     meta["status"] = "active"
     _save_meta(conversation_id, meta)
 

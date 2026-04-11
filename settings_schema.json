@@ -29,11 +29,9 @@
       "id": "model",
       "type": "select",
       "label": "Model",
-      "options": [
-        {"value": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
-        {"value": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"}
-      ],
-      "default": "gemini-2.5-pro"
+      "options": [],
+      "dynamic_source": "/api/extensions/gemini-acp/models",
+      "default": ""
     },
     {
       "id": "approval_policy",

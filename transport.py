@@ -17,6 +17,7 @@ from acp import PROTOCOL_VERSION, connect_to_agent, text_block  # noqa: E402
 from acp.schema import ClientCapabilities, Implementation  # noqa: E402
 
 _TRANSPORT_LABEL = "gemini-acp:extension"
+_MODEL_DISCOVERY_CONVERSATION_ID = "__gemini_acp_model_discovery__"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,88 @@ class GeminiPromptResult:
     stop_reason: str
     usage: Optional[dict[str, Any]]
     updates: list[dict[str, Any]]
+    user_message_id: Optional[str] = None
+
+
+def _field_value(value: Any, *names: str) -> Any:
+    if isinstance(value, dict):
+        for name in names:
+            if name in value:
+                return value.get(name)
+        return None
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def _string_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _normalize_model_entry(model: Any) -> Optional[dict[str, Any]]:
+    model_id = _string_value(_field_value(model, "model_id", "modelId", "id", "value"))
+    if not model_id:
+        return None
+    name = _string_value(_field_value(model, "name", "label")) or model_id
+    description = _string_value(_field_value(model, "description"))
+    entry: dict[str, Any] = {"id": model_id, "name": name}
+    if description:
+        entry["description"] = description
+    return entry
+
+
+def _dedupe_model_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        model_id = _string_value(entry.get("id"))
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        deduped.append(dict(entry))
+    return deduped
+
+
+def _normalize_model_entries_from_state(model_state: Any) -> tuple[list[dict[str, Any]], Optional[str]]:
+    current_model = _string_value(_field_value(model_state, "current_model_id", "currentModelId"))
+    available_models = _field_value(model_state, "available_models", "availableModels")
+    if not isinstance(available_models, list):
+        return ([], current_model)
+    entries = [entry for item in available_models if (entry := _normalize_model_entry(item))]
+    return (_dedupe_model_entries(entries), current_model)
+
+
+def _normalize_model_entries_from_select_options(options: Any) -> list[dict[str, Any]]:
+    if not isinstance(options, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in options:
+        nested_options = _field_value(item, "options")
+        if isinstance(nested_options, list):
+            entries.extend(_normalize_model_entries_from_select_options(nested_options))
+            continue
+        entry = _normalize_model_entry(item)
+        if entry:
+            entries.append(entry)
+    return _dedupe_model_entries(entries)
+
+
+def _normalize_model_entries_from_config_options(config_options: Any) -> tuple[list[dict[str, Any]], Optional[str]]:
+    if not isinstance(config_options, list):
+        return ([], None)
+    for option in config_options:
+        option_id = _string_value(_field_value(option, "id"))
+        option_type = _string_value(_field_value(option, "type"))
+        if option_id != "model" or option_type != "select":
+            continue
+        current_model = _string_value(_field_value(option, "current_value", "currentValue"))
+        options = _field_value(option, "options")
+        return (_normalize_model_entries_from_select_options(options), current_model)
+    return ([], None)
 
 
 class _DrainProtocol(asyncio.Protocol):
@@ -199,6 +282,8 @@ class GeminiACPTransport:
         self._conversation_by_session: dict[str, str] = {}
         self._approval_policy_by_conversation: dict[str, str] = {}
         self._updates_by_conversation: dict[str, list[dict[str, Any]]] = {}
+        self._model_options_by_conversation: dict[str, list[dict[str, Any]]] = {}
+        self._current_model_by_conversation: dict[str, str] = {}
 
     def is_ready(self) -> bool:
         return bool(self._shell_id and self._initialized and self._connection is not None and self._bridge is not None)
@@ -219,6 +304,8 @@ class GeminiACPTransport:
             self._conversation_by_session.clear()
             self._approval_policy_by_conversation.clear()
             self._updates_by_conversation.clear()
+            self._model_options_by_conversation.clear()
+            self._current_model_by_conversation.clear()
             if shell_id:
                 mgr = await self._fws_getter()
                 with contextlib.suppress(Exception):
@@ -233,7 +320,38 @@ class GeminiACPTransport:
             await self._ensure_connection(shell_id)
             self._approval_policy_by_conversation[conversation_id] = approval_policy
 
-    async def send_prompt(self, *, conversation_id: str, text: str, cwd: str, approval_policy: str) -> GeminiPromptResult:
+    def _remember_session_configuration(
+        self,
+        conversation_id: str,
+        *,
+        models: Any = None,
+        config_options: Any = None,
+    ) -> None:
+        entries, current_model = _normalize_model_entries_from_state(models)
+        if not entries:
+            entries, config_current_model = _normalize_model_entries_from_config_options(config_options)
+            if current_model is None:
+                current_model = config_current_model
+        if entries:
+            self._model_options_by_conversation[conversation_id] = entries
+        if current_model:
+            self._current_model_by_conversation[conversation_id] = current_model
+
+    def _known_model_options(self) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        for entries in self._model_options_by_conversation.values():
+            if isinstance(entries, list):
+                collected.extend(dict(item) for item in entries if isinstance(item, dict))
+        return _dedupe_model_entries(collected)
+
+    async def ensure_session(
+        self,
+        *,
+        conversation_id: str,
+        cwd: str,
+        approval_policy: str,
+        model: Optional[str] = None,
+    ) -> str:
         await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
         async with self._lock:
             if self._connection is None:
@@ -244,13 +362,65 @@ class GeminiACPTransport:
                 session_id = str(session.session_id)
                 self._session_ids_by_conversation[conversation_id] = session_id
                 self._conversation_by_session[session_id] = conversation_id
+                self._remember_session_configuration(
+                    conversation_id,
+                    models=getattr(session, "models", None),
+                    config_options=getattr(session, "config_options", None),
+                )
+            desired_model = _string_value(model)
+            current_model = self._current_model_by_conversation.get(conversation_id)
+            if desired_model and desired_model != current_model:
+                await self._connection.set_session_model(model_id=desired_model, session_id=session_id)
+                self._current_model_by_conversation[conversation_id] = desired_model
+            return session_id
+
+    async def list_models(self, *, cwd: str) -> list[dict[str, Any]]:
+        known = self._known_model_options()
+        if known:
+            return known
+        await self.ensure_session(
+            conversation_id=_MODEL_DISCOVERY_CONVERSATION_ID,
+            cwd=cwd,
+            approval_policy="cancel",
+        )
+        async with self._lock:
+            return self._known_model_options()
+
+    async def send_prompt(
+        self,
+        *,
+        conversation_id: str,
+        text: str,
+        cwd: str,
+        approval_policy: str,
+        model: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> GeminiPromptResult:
+        session_id = await self.ensure_session(
+            conversation_id=conversation_id,
+            cwd=cwd,
+            approval_policy=approval_policy,
+            model=model,
+        )
+        async with self._lock:
+            if self._connection is None:
+                raise RuntimeError("Gemini ACP connection not initialized")
             self._updates_by_conversation[conversation_id] = []
             try:
-                response = await self._connection.prompt(session_id=session_id, prompt=[text_block(text)])
+                response = await self._connection.prompt(
+                    session_id=session_id,
+                    prompt=[text_block(text)],
+                    message_id=message_id,
+                )
             except Exception:
                 self._updates_by_conversation.pop(conversation_id, None)
                 raise
             updates = list(self._updates_by_conversation.pop(conversation_id, []))
+            self._remember_session_configuration(
+                conversation_id,
+                models=getattr(response, "models", None),
+                config_options=getattr(response, "config_options", None),
+            )
             usage_payload: Optional[dict[str, Any]] = None
             response_usage = getattr(response, "usage", None)
             if response_usage is not None:
@@ -262,11 +432,15 @@ class GeminiACPTransport:
             if not isinstance(stop_reason_raw, str) or not stop_reason_raw.strip():
                 stop_reason_raw = getattr(response, "stopReason", None)
             stop_reason = stop_reason_raw.strip() if isinstance(stop_reason_raw, str) and stop_reason_raw.strip() else ""
+            response_user_message_id = _string_value(
+                getattr(response, "user_message_id", None) or getattr(response, "userMessageId", None)
+            )
             return GeminiPromptResult(
                 session_id=session_id,
                 stop_reason=stop_reason,
                 usage=usage_payload,
                 updates=updates,
+                user_message_id=response_user_message_id,
             )
 
     def _approval_policy_for_session(self, session_id: str) -> str:
@@ -280,6 +454,11 @@ class GeminiACPTransport:
         if not conversation_id:
             return
         self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
+        if _string_value(payload.get("sessionUpdate")) == "config_option_update":
+            self._remember_session_configuration(
+                conversation_id,
+                config_options=payload.get("configOptions"),
+            )
 
     async def _close_connection(self) -> None:
         if self._connection is not None:
@@ -373,6 +552,8 @@ class GeminiACPTransport:
         self._conversation_by_session.clear()
         self._approval_policy_by_conversation.clear()
         self._updates_by_conversation.clear()
+        self._model_options_by_conversation.clear()
+        self._current_model_by_conversation.clear()
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
         new_shell_id = await self._start_new_shell(mgr, conversation_id)
@@ -388,3 +569,5 @@ class GeminiACPTransport:
         self._conversation_by_session.clear()
         self._approval_policy_by_conversation.clear()
         self._updates_by_conversation.clear()
+        self._model_options_by_conversation.clear()
+        self._current_model_by_conversation.clear()

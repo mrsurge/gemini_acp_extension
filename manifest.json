@@ -18,7 +18,7 @@
   "capabilities": {
     "sessionResume": false,
     "streaming": false,
-    "modelListing": false,
+    "modelListing": true,
     "permissionHandling": true,
     "hasPlan": false,
     "hasTodo": false,
