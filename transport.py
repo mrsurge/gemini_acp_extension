@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -13,7 +14,7 @@ from .vendor_sdk import ensure_sdk_on_path
 
 ensure_sdk_on_path()
 
-from acp import PROTOCOL_VERSION, connect_to_agent, text_block  # noqa: E402
+from acp import PROTOCOL_VERSION, RequestError, connect_to_agent, text_block  # noqa: E402
 from acp.schema import ClientCapabilities, Implementation  # noqa: E402
 
 _TRANSPORT_LABEL = "gemini-acp:extension"
@@ -150,6 +151,29 @@ def _normalize_session_entry(session: Any, *, active: bool = False) -> Optional[
     if active:
         entry["active"] = True
     return entry
+
+
+def _looks_like_cold_session_error(exc: Exception) -> bool:
+    message = str(exc).strip().lower()
+    if isinstance(exc, RequestError):
+        if exc.code == -32002:
+            return True
+        payload = exc.data if isinstance(exc.data, dict) else None
+        payload_text = json.dumps(payload, sort_keys=True).lower() if payload is not None else ""
+        combined = " ".join(part for part in (message, payload_text) if part)
+    else:
+        combined = message
+    if "session" not in combined and "thread" not in combined:
+        return False
+    cold_markers = (
+        "not found",
+        "not loaded",
+        "unknown",
+        "missing",
+        "resource not found",
+        "no such",
+    )
+    return any(marker in combined for marker in cold_markers)
 
 
 class _DrainProtocol(asyncio.Protocol):
@@ -327,6 +351,7 @@ class GeminiACPTransport:
         self._model_options_by_conversation: dict[str, list[dict[str, Any]]] = {}
         self._current_model_by_conversation: dict[str, str] = {}
         self._agent_capabilities: Any = None
+        self._suppressed_history_updates: set[str] = set()
 
     def is_ready(self) -> bool:
         return bool(self._shell_id and self._initialized and self._connection is not None and self._bridge is not None)
@@ -374,6 +399,7 @@ class GeminiACPTransport:
             self._model_options_by_conversation.clear()
             self._current_model_by_conversation.clear()
             self._agent_capabilities = None
+            self._suppressed_history_updates.clear()
             if shell_id:
                 mgr = await self._fws_getter()
                 with contextlib.suppress(Exception):
@@ -420,6 +446,11 @@ class GeminiACPTransport:
         if previous_conversation_id and previous_conversation_id != conversation_id:
             self._session_ids_by_conversation.pop(previous_conversation_id, None)
         self._session_ids_by_conversation[conversation_id] = session_id
+        self._conversation_by_session[session_id] = conversation_id
+
+    def _route_session_to_conversation(self, conversation_id: str, session_id: str) -> None:
+        if not conversation_id or not session_id:
+            return
         self._conversation_by_session[session_id] = conversation_id
 
     async def _apply_model_selection(
@@ -506,6 +537,105 @@ class GeminiACPTransport:
             model=model,
         )
         return session_id
+
+    async def _resume_cold_session(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        cwd: str,
+        model: Optional[str] = None,
+    ) -> str:
+        if self._connection is None:
+            raise RuntimeError("Gemini ACP connection not initialized")
+        self._route_session_to_conversation(conversation_id, session_id)
+        bind_response: Any = None
+        resume_error: Optional[Exception] = None
+        self._suppressed_history_updates.add(conversation_id)
+        try:
+            try:
+                bind_response = await self._connection.resume_session(
+                    cwd=cwd,
+                    session_id=session_id,
+                    mcp_servers=[],
+                )
+            except Exception as exc:
+                resume_error = exc
+            if bind_response is None:
+                try:
+                    bind_response = await self._connection.load_session(
+                        cwd=cwd,
+                        session_id=session_id,
+                        mcp_servers=[],
+                    )
+                except Exception as exc:
+                    if resume_error is not None:
+                        raise RuntimeError(
+                            f"Gemini ACP session resume failed: {resume_error}; session load fallback also failed: {exc}"
+                        ) from exc
+                    raise RuntimeError(f"Gemini ACP session load failed: {exc}") from exc
+        finally:
+            self._suppressed_history_updates.discard(conversation_id)
+        self._remember_session_binding(conversation_id, session_id)
+        self._remember_session_configuration(
+            conversation_id,
+            models=getattr(bind_response, "models", None),
+            config_options=getattr(bind_response, "config_options", None),
+        )
+        await self._apply_model_selection(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            model=model,
+        )
+        return session_id
+
+    async def _prompt_once(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        text: str,
+        message_id: Optional[str],
+    ) -> GeminiPromptResult:
+        if self._connection is None:
+            raise RuntimeError("Gemini ACP connection not initialized")
+        self._updates_by_conversation[conversation_id] = []
+        try:
+            response = await self._connection.prompt(
+                session_id=session_id,
+                prompt=[text_block(text)],
+                message_id=message_id,
+            )
+        except Exception:
+            self._updates_by_conversation.pop(conversation_id, None)
+            raise
+        updates = list(self._updates_by_conversation.pop(conversation_id, []))
+        self._remember_session_configuration(
+            conversation_id,
+            models=getattr(response, "models", None),
+            config_options=getattr(response, "config_options", None),
+        )
+        usage_payload: Optional[dict[str, Any]] = None
+        response_usage = getattr(response, "usage", None)
+        if response_usage is not None:
+            if hasattr(response_usage, "model_dump"):
+                usage_payload = response_usage.model_dump(mode="json", by_alias=True)
+            elif isinstance(response_usage, dict):
+                usage_payload = dict(response_usage)
+        stop_reason_raw = getattr(response, "stop_reason", None)
+        if not isinstance(stop_reason_raw, str) or not stop_reason_raw.strip():
+            stop_reason_raw = getattr(response, "stopReason", None)
+        stop_reason = stop_reason_raw.strip() if isinstance(stop_reason_raw, str) and stop_reason_raw.strip() else ""
+        response_user_message_id = _string_value(
+            getattr(response, "user_message_id", None) or getattr(response, "userMessageId", None)
+        )
+        return GeminiPromptResult(
+            session_id=session_id,
+            stop_reason=stop_reason,
+            usage=usage_payload,
+            updates=updates,
+            user_message_id=response_user_message_id,
+        )
 
     async def ensure_session(
         self,
@@ -654,53 +784,59 @@ class GeminiACPTransport:
         message_id: Optional[str] = None,
         existing_session_id: Optional[str] = None,
     ) -> GeminiPromptResult:
-        session_id = await self.ensure_session(
-            conversation_id=conversation_id,
-            cwd=cwd,
-            approval_policy=approval_policy,
-            model=model,
-            existing_session_id=existing_session_id,
-        )
+        await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("Gemini ACP connection not initialized")
-            self._updates_by_conversation[conversation_id] = []
-            try:
-                response = await self._connection.prompt(
+            bound_session_id = _string_value(existing_session_id)
+            live_session_id = self._session_ids_by_conversation.get(conversation_id)
+            cold_bound_session = bool(bound_session_id and live_session_id != bound_session_id)
+            if cold_bound_session and bound_session_id:
+                session_id = bound_session_id
+                self._route_session_to_conversation(conversation_id, session_id)
+            else:
+                session_id = live_session_id
+                if not session_id:
+                    session = await self._connection.new_session(cwd=cwd, mcp_servers=[])
+                    session_id = str(session.session_id)
+                    self._remember_session_binding(conversation_id, session_id)
+                    self._remember_session_configuration(
+                        conversation_id,
+                        models=getattr(session, "models", None),
+                        config_options=getattr(session, "config_options", None),
+                    )
+                await self._apply_model_selection(
+                    conversation_id=conversation_id,
                     session_id=session_id,
-                    prompt=[text_block(text)],
+                    model=model,
+                )
+            try:
+                result = await self._prompt_once(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    text=text,
                     message_id=message_id,
                 )
-            except Exception:
+            except Exception as exc:
+                if not (cold_bound_session and bound_session_id and _looks_like_cold_session_error(exc)):
+                    raise
                 self._updates_by_conversation.pop(conversation_id, None)
-                raise
-            updates = list(self._updates_by_conversation.pop(conversation_id, []))
-            self._remember_session_configuration(
-                conversation_id,
-                models=getattr(response, "models", None),
-                config_options=getattr(response, "config_options", None),
-            )
-            usage_payload: Optional[dict[str, Any]] = None
-            response_usage = getattr(response, "usage", None)
-            if response_usage is not None:
-                if hasattr(response_usage, "model_dump"):
-                    usage_payload = response_usage.model_dump(mode="json", by_alias=True)
-                elif isinstance(response_usage, dict):
-                    usage_payload = dict(response_usage)
-            stop_reason_raw = getattr(response, "stop_reason", None)
-            if not isinstance(stop_reason_raw, str) or not stop_reason_raw.strip():
-                stop_reason_raw = getattr(response, "stopReason", None)
-            stop_reason = stop_reason_raw.strip() if isinstance(stop_reason_raw, str) and stop_reason_raw.strip() else ""
-            response_user_message_id = _string_value(
-                getattr(response, "user_message_id", None) or getattr(response, "userMessageId", None)
-            )
-            return GeminiPromptResult(
-                session_id=session_id,
-                stop_reason=stop_reason,
-                usage=usage_payload,
-                updates=updates,
-                user_message_id=response_user_message_id,
-            )
+                resumed_session_id = await self._resume_cold_session(
+                    conversation_id=conversation_id,
+                    session_id=bound_session_id,
+                    cwd=cwd,
+                    model=model,
+                )
+                result = await self._prompt_once(
+                    conversation_id=conversation_id,
+                    session_id=resumed_session_id,
+                    text=text,
+                    message_id=message_id,
+                )
+            else:
+                if cold_bound_session and bound_session_id:
+                    self._remember_session_binding(conversation_id, bound_session_id)
+            return result
 
     def _approval_policy_for_session(self, session_id: str) -> str:
         conversation_id = self._conversation_by_session.get(session_id)
@@ -712,12 +848,19 @@ class GeminiACPTransport:
         conversation_id = self._conversation_by_session.get(session_id)
         if not conversation_id:
             return
-        self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
-        if _string_value(payload.get("sessionUpdate")) == "config_option_update":
+        kind = _string_value(payload.get("sessionUpdate")) or _string_value(payload.get("session_update")) or ""
+        if kind == "config_option_update":
             self._remember_session_configuration(
                 conversation_id,
                 config_options=payload.get("configOptions"),
             )
+        if conversation_id in self._suppressed_history_updates and kind in {
+            "user_message_chunk",
+            "agent_message_chunk",
+            "agent_thought_chunk",
+        }:
+            return
+        self._updates_by_conversation.setdefault(conversation_id, []).append(payload)
 
     async def _close_connection(self) -> None:
         if self._connection is not None:
@@ -819,6 +962,7 @@ class GeminiACPTransport:
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
         self._agent_capabilities = None
+        self._suppressed_history_updates.clear()
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
         new_shell_id = await self._start_new_shell(mgr, conversation_id)
@@ -837,3 +981,4 @@ class GeminiACPTransport:
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
         self._agent_capabilities = None
+        self._suppressed_history_updates.clear()
