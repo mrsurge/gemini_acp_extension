@@ -2,13 +2,13 @@
   "schema_version": 1,
   "id": "gemini-acp",
   "name": "Gemini ACP",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "gemini_acp",
   "compat": {
     "app_server_manifest_min": 1,
     "app_server_manifest_max": 1
   },
-  "description": "Gemini ACP scaffold extension for multi-root loader testing.",
+  "description": "Gemini ACP extension via framework-shells and the ACP Python SDK.",
   "enabled": true,
   "agent": {
     "command": "gemini",

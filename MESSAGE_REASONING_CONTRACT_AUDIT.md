@@ -32,7 +32,7 @@ But Gemini still needs a clearer shared contract for:
 
 ## Current Gemini status
 
-Current Gemini scaffolding in this repo already aligns with part of the shared lane:
+Current Gemini implementation in this repo already aligns with part of the shared lane:
 
 - `client.py` emits generic failed-send results that can restore the composer draft and surface a shared generic error card
 - `router.py` turns collected ACP assistant chunks into:

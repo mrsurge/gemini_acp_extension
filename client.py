@@ -1,4 +1,4 @@
-"""Gemini ACP scaffold client module for multi-root loading tests."""
+"""Gemini ACP client module for multi-root loading tests."""
 
 from __future__ import annotations
 
@@ -342,7 +342,6 @@ async def handle_message(
         "stop_reason": prompt_result.stop_reason,
         "event_count": len(events) if isinstance(events, list) else 0,
         "transcript_entry_count": len(transcript_entries) if isinstance(transcript_entries, list) else 0,
-        "scaffold": True,
     }
 
 

@@ -1,4 +1,4 @@
-"""Gemini ACP routing helpers for the scaffold."""
+"""Gemini ACP routing helpers."""
 
 from __future__ import annotations
 
@@ -375,5 +375,5 @@ async def route_event(
     del extension_id, label, payload, conversation_id, thread_id, turn_id, request_id
     return {
         "ok": False,
-        "error": "Gemini ACP scaffold uses SDK callbacks inside the client/transport layer; no external router is wired yet.",
+        "error": "Gemini ACP uses SDK callbacks inside the client/transport layer; no external router is wired yet.",
     }

@@ -1,12 +1,12 @@
 {
   "version": "1",
-  "description": "Settings schema for the Gemini ACP scaffold",
+  "description": "Settings schema for the Gemini ACP extension",
   "fields": [
     {
       "id": "information",
       "type": "section",
       "label": "Information",
-      "description": "This scaffold has a minimal Gemini ACP runtime path, but live provider information and normalized runtime policy discovery are still in progress."
+      "description": "This extension has a focused Gemini ACP runtime path, but live provider information and normalized runtime policy discovery are still in progress."
     },
     {
       "id": "information_status",

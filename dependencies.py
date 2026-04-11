@@ -1,4 +1,4 @@
-"""Dependency checks for the Gemini ACP scaffold."""
+"""Dependency checks for Gemini ACP."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""ACP SDK client bridge for the Gemini ACP scaffold."""
+"""ACP SDK client bridge for Gemini ACP."""
 
 from __future__ import annotations
 

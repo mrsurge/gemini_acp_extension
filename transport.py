@@ -1,4 +1,4 @@
-"""Framework-shells transport scaffold for Gemini ACP over the vendored SDK."""
+"""Framework-shells transport for Gemini ACP over the vendored SDK."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -21,6 +22,11 @@ from acp.schema import ClientCapabilities, Implementation  # noqa: E402
 _TRANSPORT_LABEL = "gemini-acp:extension"
 _MODEL_DISCOVERY_CONVERSATION_ID = "__gemini_acp_model_discovery__"
 _SESSION_LIST_CONVERSATION_ID = "__gemini_acp_session_list__"
+_QUIESCENCE_POLL_SECONDS = 0.02
+_QUIESCENCE_QUIET_SECONDS = 0.15
+_QUIESCENCE_TIMEOUT_SECONDS = 2.0
+_SUPPRESS_QUIESCENCE_QUIET_SECONDS = 0.25
+_SUPPRESS_QUIESCENCE_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -359,7 +365,6 @@ class GeminiACPTransport:
         self._live_update_callbacks: dict[str, LiveUpdateCallback] = {}
         self._live_update_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._suppressed_update_counts: dict[str, int] = {}
-        self._suppressed_history_updates: set[str] = set()
 
     def is_ready(self) -> bool:
         return bool(self._shell_id and self._initialized and self._connection is not None and self._bridge is not None)
@@ -411,7 +416,6 @@ class GeminiACPTransport:
             self._live_update_callbacks.clear()
             self._live_update_tasks.clear()
             self._suppressed_update_counts.clear()
-            self._suppressed_history_updates.clear()
             if shell_id:
                 mgr = await self._fws_getter()
                 with contextlib.suppress(Exception):
@@ -504,21 +508,24 @@ class GeminiACPTransport:
         conversation_id: str,
         *,
         count_getter: Callable[[str], int],
-        stable_iterations: int = 3,
-        max_iterations: int = 12,
+        quiet_seconds: float = _QUIESCENCE_QUIET_SECONDS,
+        timeout_seconds: float = _QUIESCENCE_TIMEOUT_SECONDS,
+        poll_seconds: float = _QUIESCENCE_POLL_SECONDS,
     ) -> None:
-        stable = 0
         last_count = count_getter(conversation_id)
-        for _ in range(max_iterations):
-            await asyncio.sleep(0)
+        last_change_at = time.monotonic()
+        deadline = last_change_at + timeout_seconds
+        while True:
+            now = time.monotonic()
+            if now - last_change_at >= quiet_seconds:
+                return
+            if now >= deadline:
+                return
+            await asyncio.sleep(min(poll_seconds, max(0.0, deadline - now)))
             current_count = count_getter(conversation_id)
-            if current_count == last_count:
-                stable += 1
-                if stable >= stable_iterations:
-                    return
-                continue
-            stable = 0
-            last_count = current_count
+            if current_count != last_count:
+                last_count = current_count
+                last_change_at = time.monotonic()
 
     async def _apply_model_selection(
         self,
@@ -621,7 +628,6 @@ class GeminiACPTransport:
         resume_error: Optional[Exception] = None
         self._set_capture_mode(conversation_id, "suppress")
         self._suppressed_update_counts[conversation_id] = 0
-        self._suppressed_history_updates.add(conversation_id)
         try:
             if self.supports_resume_session():
                 try:
@@ -648,11 +654,12 @@ class GeminiACPTransport:
             await self._wait_for_count_quiescence(
                 conversation_id,
                 count_getter=lambda cid: self._suppressed_update_counts.get(cid, 0),
+                quiet_seconds=_SUPPRESS_QUIESCENCE_QUIET_SECONDS,
+                timeout_seconds=_SUPPRESS_QUIESCENCE_TIMEOUT_SECONDS,
             )
         finally:
             self._set_capture_mode(conversation_id, None)
             self._suppressed_update_counts.pop(conversation_id, None)
-            self._suppressed_history_updates.discard(conversation_id)
         self._remember_session_binding(conversation_id, session_id)
         self._remember_session_configuration(
             conversation_id,
@@ -1077,7 +1084,6 @@ class GeminiACPTransport:
         self._live_update_callbacks.clear()
         self._live_update_tasks.clear()
         self._suppressed_update_counts.clear()
-        self._suppressed_history_updates.clear()
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
         new_shell_id = await self._start_new_shell(mgr, conversation_id)
@@ -1100,4 +1106,3 @@ class GeminiACPTransport:
         self._live_update_callbacks.clear()
         self._live_update_tasks.clear()
         self._suppressed_update_counts.clear()
-        self._suppressed_history_updates.clear()

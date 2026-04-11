@@ -167,9 +167,9 @@ At minimum:
 
 If the backend cannot honestly enforce one of these modes yet, the extension must not advertise it as supported.
 
-### 7.3 Current scaffold reality
+### 7.3 Current implementation reality
 
-Today, the scaffold's bridge rejects local ACP file/terminal helper methods with `method_not_found`. That means the current bridge is not yet a true workspace-write bridge, even if the upstream Gemini runtime can do other work internally.
+Today, the implementation's bridge rejects local ACP file/terminal helper methods with `method_not_found`. That means the current bridge is not yet a true workspace-write bridge, even if the upstream Gemini runtime can do other work internally.
 
 So the contract for the next implementation pass is:
 
@@ -225,7 +225,7 @@ The next implementation pass should be considered successful when all of the fol
 
 ## 11. Known intentional gaps right now
 
-The current scaffold is still intentionally incomplete:
+At the time this document was drafted, the implementation was still intentionally incomplete:
 
 - `router.py` is still a stub
 - `session_update` payloads are currently collected internally, not yet translated into live/transcript output
@@ -234,4 +234,4 @@ The current scaffold is still intentionally incomplete:
 - sandbox/write policy is not yet normalized to the shared field names and runtime-options path
 - live provider information blocks are not wired yet
 
-That is acceptable for the scaffold phase. This document exists to define the minimal contract the next pass should implement against.
+That was acceptable for the initial implementation phase. This document exists to define the minimal contract the next pass should implement against.
