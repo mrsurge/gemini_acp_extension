@@ -3,6 +3,20 @@
   "description": "Settings schema for the Gemini ACP scaffold",
   "fields": [
     {
+      "id": "information",
+      "type": "section",
+      "label": "Information",
+      "description": "This scaffold has a minimal Gemini ACP runtime path, but live provider information and normalized runtime policy discovery are still in progress."
+    },
+    {
+      "id": "information_status",
+      "type": "info",
+      "label": "Provider Status",
+      "text": "Live Gemini provider information is not wired yet.",
+      "detail": "This extension currently focuses on shell attach, prompt send, and shared transcript/event semantics.",
+      "tone": "warning"
+    },
+    {
       "id": "cwd",
       "type": "path",
       "label": "Working Directory",
@@ -22,14 +36,35 @@
       "default": "gemini-2.5-pro"
     },
     {
-      "id": "approval_mode",
+      "id": "approval_policy",
       "type": "select",
-      "label": "Permission Mode",
+      "label": "Approval Policy",
       "options": [
         {"value": "cancel", "label": "Cancel all requests"},
         {"value": "auto-approve", "label": "Auto-approve first allow option"}
       ],
-      "default": "cancel"
+      "dynamic_source": "/api/appserver/runtime_options",
+      "dynamic_options_key": "approval",
+      "default": "cancel",
+      "runtime_option": {
+        "kind": "approval",
+        "footer": true,
+        "footer_label": "Approval"
+      }
+    },
+    {
+      "id": "sandbox_policy",
+      "type": "select",
+      "label": "Directory Trust",
+      "options": [
+        {"value": "agent-default", "label": "Gemini default (not normalized yet)"}
+      ],
+      "dynamic_source": "/api/appserver/runtime_options",
+      "dynamic_options_key": "sandbox",
+      "default": "agent-default",
+      "runtime_option": {
+        "kind": "sandbox"
+      }
     },
     {
       "id": "developer_instructions",

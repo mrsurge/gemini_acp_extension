@@ -12,7 +12,7 @@ from acp import RequestError  # noqa: E402
 from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse  # noqa: E402
 
 UpdateCallback = Callable[[str, dict[str, Any]], None]
-ApprovalModeResolver = Callable[[str], str]
+ApprovalPolicyResolver = Callable[[str], str]
 
 
 class GeminiACPBridgeClient:
@@ -20,11 +20,11 @@ class GeminiACPBridgeClient:
         self,
         *,
         on_update: Optional[UpdateCallback] = None,
-        approval_mode_resolver: Optional[ApprovalModeResolver] = None,
+        approval_policy_resolver: Optional[ApprovalPolicyResolver] = None,
     ) -> None:
         self._conn: Any = None
         self._on_update = on_update
-        self._approval_mode_resolver = approval_mode_resolver or (lambda _session_id: "cancel")
+        self._approval_policy_resolver = approval_policy_resolver or (lambda _session_id: "cancel")
 
     def on_connect(self, conn: Any) -> None:
         self._conn = conn
@@ -41,8 +41,8 @@ class GeminiACPBridgeClient:
 
     async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> RequestPermissionResponse:
         del tool_call, kwargs
-        approval_mode = self._approval_mode_resolver(session_id)
-        if approval_mode == "auto-approve":
+        approval_policy = self._approval_policy_resolver(session_id)
+        if approval_policy == "auto-approve":
             preferred = _pick_preferred_option(options)
             if preferred is not None:
                 return RequestPermissionResponse(

@@ -1,8 +1,13 @@
 {
+  "schema_version": 1,
   "id": "gemini-acp",
   "name": "Gemini ACP",
   "version": "0.1.0",
   "type": "gemini_acp",
+  "compat": {
+    "app_server_manifest_min": 1,
+    "app_server_manifest_max": 1
+  },
   "description": "Gemini ACP scaffold extension for multi-root loader testing.",
   "enabled": true,
   "agent": {

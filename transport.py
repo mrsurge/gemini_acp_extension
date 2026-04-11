@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -16,6 +17,14 @@ from acp import PROTOCOL_VERSION, connect_to_agent, text_block  # noqa: E402
 from acp.schema import ClientCapabilities, Implementation  # noqa: E402
 
 _TRANSPORT_LABEL = "gemini-acp:extension"
+
+
+@dataclass(frozen=True)
+class GeminiPromptResult:
+    session_id: str
+    stop_reason: str
+    usage: Optional[dict[str, Any]]
+    updates: list[dict[str, Any]]
 
 
 class _DrainProtocol(asyncio.Protocol):
@@ -188,7 +197,7 @@ class GeminiACPTransport:
         self._launch_cwd = str(Path.home())
         self._session_ids_by_conversation: dict[str, str] = {}
         self._conversation_by_session: dict[str, str] = {}
-        self._approval_mode_by_conversation: dict[str, str] = {}
+        self._approval_policy_by_conversation: dict[str, str] = {}
         self._updates_by_conversation: dict[str, list[dict[str, Any]]] = {}
 
     def is_ready(self) -> bool:
@@ -208,24 +217,24 @@ class GeminiACPTransport:
             self._initialized = False
             self._session_ids_by_conversation.clear()
             self._conversation_by_session.clear()
-            self._approval_mode_by_conversation.clear()
+            self._approval_policy_by_conversation.clear()
             self._updates_by_conversation.clear()
             if shell_id:
                 mgr = await self._fws_getter()
                 with contextlib.suppress(Exception):
                     await mgr.terminate_shell(shell_id, force=True)
 
-    async def ensure_ready(self, *, conversation_id: str, cwd: str, approval_mode: str) -> None:
+    async def ensure_ready(self, *, conversation_id: str, cwd: str, approval_policy: str) -> None:
         async with self._lock:
             self._launch_cwd = cwd
             shell_id = await self._get_or_start_shell(conversation_id)
             if not await self._pipe_available(shell_id):
                 shell_id = await self._restart_shell(shell_id, conversation_id)
             await self._ensure_connection(shell_id)
-            self._approval_mode_by_conversation[conversation_id] = approval_mode
+            self._approval_policy_by_conversation[conversation_id] = approval_policy
 
-    async def send_prompt(self, *, conversation_id: str, text: str, cwd: str, approval_mode: str) -> str:
-        await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_mode=approval_mode)
+    async def send_prompt(self, *, conversation_id: str, text: str, cwd: str, approval_policy: str) -> GeminiPromptResult:
+        await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("Gemini ACP connection not initialized")
@@ -235,14 +244,36 @@ class GeminiACPTransport:
                 session_id = str(session.session_id)
                 self._session_ids_by_conversation[conversation_id] = session_id
                 self._conversation_by_session[session_id] = conversation_id
-            await self._connection.prompt(session_id=session_id, prompt=[text_block(text)])
-            return session_id
+            self._updates_by_conversation[conversation_id] = []
+            try:
+                response = await self._connection.prompt(session_id=session_id, prompt=[text_block(text)])
+            except Exception:
+                self._updates_by_conversation.pop(conversation_id, None)
+                raise
+            updates = list(self._updates_by_conversation.pop(conversation_id, []))
+            usage_payload: Optional[dict[str, Any]] = None
+            response_usage = getattr(response, "usage", None)
+            if response_usage is not None:
+                if hasattr(response_usage, "model_dump"):
+                    usage_payload = response_usage.model_dump(mode="json", by_alias=True)
+                elif isinstance(response_usage, dict):
+                    usage_payload = dict(response_usage)
+            stop_reason_raw = getattr(response, "stop_reason", None)
+            if not isinstance(stop_reason_raw, str) or not stop_reason_raw.strip():
+                stop_reason_raw = getattr(response, "stopReason", None)
+            stop_reason = stop_reason_raw.strip() if isinstance(stop_reason_raw, str) and stop_reason_raw.strip() else ""
+            return GeminiPromptResult(
+                session_id=session_id,
+                stop_reason=stop_reason,
+                usage=usage_payload,
+                updates=updates,
+            )
 
-    def _approval_mode_for_session(self, session_id: str) -> str:
+    def _approval_policy_for_session(self, session_id: str) -> str:
         conversation_id = self._conversation_by_session.get(session_id)
         if not conversation_id:
             return "cancel"
-        return self._approval_mode_by_conversation.get(conversation_id, "cancel")
+        return self._approval_policy_by_conversation.get(conversation_id, "cancel")
 
     def _handle_update(self, session_id: str, payload: dict[str, Any]) -> None:
         conversation_id = self._conversation_by_session.get(session_id)
@@ -269,7 +300,7 @@ class GeminiACPTransport:
         reader, writer = await bridge.start()
         client = GeminiACPBridgeClient(
             on_update=self._handle_update,
-            approval_mode_resolver=self._approval_mode_for_session,
+            approval_policy_resolver=self._approval_policy_for_session,
         )
         connection = connect_to_agent(client, writer, reader)
         await connection.initialize(
@@ -340,7 +371,7 @@ class GeminiACPTransport:
         self._initialized = False
         self._session_ids_by_conversation.clear()
         self._conversation_by_session.clear()
-        self._approval_mode_by_conversation.clear()
+        self._approval_policy_by_conversation.clear()
         self._updates_by_conversation.clear()
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
@@ -355,5 +386,5 @@ class GeminiACPTransport:
         self._initialized = False
         self._session_ids_by_conversation.clear()
         self._conversation_by_session.clear()
-        self._approval_mode_by_conversation.clear()
+        self._approval_policy_by_conversation.clear()
         self._updates_by_conversation.clear()

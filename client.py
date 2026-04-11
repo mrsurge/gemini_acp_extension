@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .dependencies import check_dependencies
+from .router import build_prompt_turn_output, utc_ts
 from .transport import GeminiACPTransport
 
 _broadcast_fn: Optional[Callable[..., Any]] = None
@@ -17,6 +18,15 @@ _registered_extension_ids: set[str] = set()
 _ready_extensions: set[str] = set()
 _transport: Optional[GeminiACPTransport] = None
 _EXTENSION_ROOT = Path(__file__).parent
+_DEFAULT_APPROVAL_POLICY = "cancel"
+_DEFAULT_SANDBOX_POLICY = "agent-default"
+_APPROVAL_POLICY_OPTIONS = [
+    {"value": "cancel", "label": "Cancel all requests"},
+    {"value": "auto-approve", "label": "Auto-approve first allow option"},
+]
+_SANDBOX_POLICY_OPTIONS = [
+    {"value": "agent-default", "label": "Gemini default (not normalized yet)"},
+]
 
 
 def init_gemini_acp_manager(
@@ -44,6 +54,63 @@ def _settings_schema_path() -> Path:
     return _EXTENSION_ROOT / "settings_schema.json"
 
 
+def _runtime_option_descriptor(
+    setting_key: str,
+    label: str,
+    options: List[Dict[str, str]],
+    current: Optional[str],
+    default: str,
+) -> Dict[str, Any]:
+    return {
+        "settingKey": setting_key,
+        "label": label,
+        "options": [dict(item) for item in options],
+        "current": current or "",
+        "default": default,
+    }
+
+
+def _load_meta(conversation_id: str) -> Dict[str, Any]:
+    loader = _meta_fns.get("load")
+    if not callable(loader):
+        return {}
+    meta = loader(conversation_id)
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _save_meta(conversation_id: str, meta: Dict[str, Any]) -> None:
+    saver = _meta_fns.get("save")
+    if callable(saver):
+        saver(conversation_id, meta)
+
+
+def _merge_runtime_settings(conversation_id: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if conversation_id:
+        meta = _load_meta(conversation_id)
+        meta_settings = meta.get("settings")
+        if isinstance(meta_settings, dict):
+            merged.update(meta_settings)
+    if isinstance(settings, dict):
+        merged.update(settings)
+    return merged
+
+
+def _normalize_approval_policy(settings: Dict[str, Any]) -> str:
+    raw = settings.get("approval_policy")
+    if raw is None:
+        raw = settings.get("approval_mode")
+    value = str(raw or _DEFAULT_APPROVAL_POLICY).strip()
+    allowed = {item["value"] for item in _APPROVAL_POLICY_OPTIONS}
+    return value if value in allowed else _DEFAULT_APPROVAL_POLICY
+
+
+def _normalize_sandbox_policy(settings: Dict[str, Any]) -> str:
+    value = str(settings.get("sandbox_policy") or _DEFAULT_SANDBOX_POLICY).strip()
+    allowed = {item["value"] for item in _SANDBOX_POLICY_OPTIONS}
+    return value if value in allowed else _DEFAULT_SANDBOX_POLICY
+
+
 async def get_settings_schema(extension_id: str) -> Dict[str, Any]:
     del extension_id
     return json.loads(_settings_schema_path().read_text(encoding="utf-8"))
@@ -51,6 +118,31 @@ async def get_settings_schema(extension_id: str) -> Dict[str, Any]:
 
 async def get_splash_schema(extension_id: str) -> Dict[str, Any]:
     return await get_settings_schema(extension_id)
+
+
+async def get_runtime_options(
+    extension_id: str,
+    conversation_id: Optional[str] = None,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    merged = _merge_runtime_settings(conversation_id or "", settings=settings)
+    return {
+        "agent": extension_id,
+        "approval": _runtime_option_descriptor(
+            "approval_policy",
+            "Approval Policy",
+            _APPROVAL_POLICY_OPTIONS,
+            _normalize_approval_policy(merged),
+            _DEFAULT_APPROVAL_POLICY,
+        ),
+        "sandbox": _runtime_option_descriptor(
+            "sandbox_policy",
+            "Directory Trust",
+            _SANDBOX_POLICY_OPTIONS,
+            _normalize_sandbox_policy(merged),
+            _DEFAULT_SANDBOX_POLICY,
+        ),
+    }
 
 
 async def list_models() -> List[Dict[str, Any]]:
@@ -79,7 +171,7 @@ async def warm_up_all_extensions(timeout: float = 60.0) -> Dict[str, bool]:
             transport.ensure_ready(
                 conversation_id="__gemini_acp_warmup__",
                 cwd=str(Path.home()),
-                approval_mode="cancel",
+                approval_policy=_DEFAULT_APPROVAL_POLICY,
             ),
             timeout=timeout,
         )
@@ -108,41 +200,88 @@ async def handle_message(
     agent_type: str,
     settings: Dict[str, Any],
 ) -> Dict[str, Any]:
-    del agent_type
+    extension_id = agent_type or "gemini-acp"
     transport = _transport
     if transport is None:
         return {"ok": False, "error": "Gemini ACP transport not initialized"}
     if not conversation_id or not text.strip():
         return {"ok": False, "error": "conversation_id and text required"}
-    cwd = str(settings.get("cwd") or Path.home())
-    approval_mode = str(settings.get("approval_mode") or "cancel")
+    merged_settings = _merge_runtime_settings(conversation_id, settings=settings)
+    cwd = str(merged_settings.get("cwd") or Path.home())
+    approval_policy = _normalize_approval_policy(merged_settings)
+    debug_trace = bool(merged_settings.get("debug_trace"))
+    meta = _load_meta(conversation_id)
+    turn_counter_raw = meta.get("gemini_acp_turn_counter")
+    turn_counter = turn_counter_raw if isinstance(turn_counter_raw, int) else 0
+    turn_counter += 1
+    turn_id = f"gemini_turn_{turn_counter}"
+    meta["gemini_acp_turn_counter"] = turn_counter
     try:
-        session_id = await transport.send_prompt(
+        prompt_result = await transport.send_prompt(
             conversation_id=conversation_id,
             text=text,
             cwd=cwd,
-            approval_mode=approval_mode,
+            approval_policy=approval_policy,
         )
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        message = f"Gemini ACP send failed: {exc}"
+        if callable(_broadcast_fn):
+            await _broadcast_fn({
+                "type": "error",
+                "conversation_id": conversation_id,
+                "turn_id": turn_id,
+                "message": message,
+                "source": "gemini-acp",
+            })
+        if callable(_transcript_fn):
+            await _transcript_fn(conversation_id, {
+                "role": "error",
+                "message": message,
+                "text": message,
+                "timestamp": utc_ts(),
+                "turn_id": turn_id,
+                "source": "gemini-acp",
+            })
+        meta["status"] = "error"
+        meta["last_error"] = message
+        _save_meta(conversation_id, meta)
+        return {"ok": False, "error": str(exc), "restore_draft": True}
 
-    _ready_extensions.add("gemini-acp")
+    routed = build_prompt_turn_output(
+        conversation_id=conversation_id,
+        session_id=prompt_result.session_id,
+        turn_id=turn_id,
+        updates=prompt_result.updates,
+        stop_reason=prompt_result.stop_reason,
+        debug_trace=debug_trace,
+    )
+    transcript_entries = routed.get("transcript_entries")
+    if callable(_transcript_fn) and isinstance(transcript_entries, list):
+        for entry in transcript_entries:
+            if isinstance(entry, dict):
+                await _transcript_fn(conversation_id, entry)
 
-    load_meta = _meta_fns.get("load")
-    save_meta = _meta_fns.get("save")
-    if callable(load_meta) and callable(save_meta):
-        meta = load_meta(conversation_id)
-        if not isinstance(meta, dict):
-            meta = {}
-        meta["gemini_acp_session_id"] = session_id
-        meta["gemini_acp_shell_id"] = transport.runtime_instance_id()
-        meta["status"] = "active"
-        save_meta(conversation_id, meta)
+    events = routed.get("events")
+    if callable(_broadcast_fn) and isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict):
+                await _broadcast_fn(event)
+
+    _ready_extensions.add(extension_id)
+
+    meta["gemini_acp_session_id"] = prompt_result.session_id
+    meta["gemini_acp_shell_id"] = transport.runtime_instance_id()
+    meta["gemini_acp_last_stop_reason"] = prompt_result.stop_reason
+    meta["status"] = "active"
+    _save_meta(conversation_id, meta)
 
     return {
         "ok": True,
-        "session_id": session_id,
+        "session_id": prompt_result.session_id,
         "shell_id": transport.runtime_instance_id(),
+        "stop_reason": prompt_result.stop_reason,
+        "event_count": len(events) if isinstance(events, list) else 0,
+        "transcript_entry_count": len(transcript_entries) if isinstance(transcript_entries, list) else 0,
         "scaffold": True,
     }
 
