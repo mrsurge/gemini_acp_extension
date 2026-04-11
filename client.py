@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .dependencies import check_dependencies
-from .router import build_prompt_turn_output, build_user_turn_output, utc_ts
+from .router import build_history_transcript_entries, build_prompt_turn_output, build_user_turn_output, utc_ts
 from .transport import GeminiACPTransport
 
 _broadcast_fn: Optional[Callable[..., Any]] = None
@@ -83,6 +83,14 @@ def _save_meta(conversation_id: str, meta: Dict[str, Any]) -> None:
     saver = _meta_fns.get("save")
     if callable(saver):
         saver(conversation_id, meta)
+
+
+def _bound_session_id(meta: Dict[str, Any]) -> Optional[str]:
+    for key in ("thread_id", "gemini_acp_session_id"):
+        raw = meta.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
 
 
 def _merge_runtime_settings(conversation_id: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -168,6 +176,17 @@ async def list_models() -> List[Dict[str, Any]]:
         return []
 
 
+async def list_sessions(cwd: Optional[str] = None) -> List[Dict[str, Any]]:
+    transport = _transport
+    if transport is None:
+        return []
+    try:
+        return await transport.list_sessions(cwd=str(Path(cwd).expanduser()) if cwd else None)
+    except Exception as exc:
+        print(f"[GeminiACP] list_sessions failed: {exc}")
+        return []
+
+
 async def warm_up_all_extensions(timeout: float = 60.0) -> Dict[str, bool]:
     results = {ext_id: False for ext_id in sorted(_registered_extension_ids)}
     transport = _transport
@@ -218,6 +237,7 @@ async def handle_message(
     approval_policy = _normalize_approval_policy(merged_settings)
     debug_trace = bool(merged_settings.get("debug_trace"))
     meta = _load_meta(conversation_id)
+    existing_session_id = _bound_session_id(meta)
     turn_counter_raw = meta.get("gemini_acp_turn_counter")
     turn_counter = turn_counter_raw if isinstance(turn_counter_raw, int) else 0
     turn_counter += 1
@@ -248,6 +268,7 @@ async def handle_message(
             approval_policy=approval_policy,
             model=str(merged_settings.get("model") or "").strip() or None,
             message_id=user_message_id,
+            existing_session_id=existing_session_id,
         )
     except Exception as exc:
         message = f"Gemini ACP send failed: {exc}"
@@ -295,6 +316,7 @@ async def handle_message(
 
     _ready_extensions.add(extension_id)
 
+    meta["thread_id"] = prompt_result.session_id
     meta["gemini_acp_session_id"] = prompt_result.session_id
     meta["gemini_acp_shell_id"] = transport.runtime_instance_id()
     meta["gemini_acp_last_stop_reason"] = prompt_result.stop_reason
@@ -311,6 +333,95 @@ async def handle_message(
         "transcript_entry_count": len(transcript_entries) if isinstance(transcript_entries, list) else 0,
         "scaffold": True,
     }
+
+
+async def resume_session_with_history(
+    session_id: str,
+    conversation_id: str,
+    cwd: Optional[str] = None,
+    model: Optional[str] = None,
+    settings: Optional[Dict[str, Any]] = None,
+    extension_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    transport = _transport
+    if transport is None:
+        return {"ok": False, "error": "Gemini ACP transport not initialized"}
+    if not session_id or not conversation_id:
+        return {"ok": False, "error": "session_id and conversation_id are required"}
+    meta = _load_meta(conversation_id)
+    existing_session_id = _bound_session_id(meta)
+    if existing_session_id and existing_session_id != session_id:
+        return {
+            "ok": False,
+            "error": f"Conversation already bound to session {existing_session_id[:8]}",
+        }
+    merged_settings = _merge_runtime_settings(conversation_id, settings=settings)
+    if cwd:
+        merged_settings["cwd"] = cwd
+    if model:
+        merged_settings["model"] = model
+    resolved_cwd = str(merged_settings.get("cwd") or Path.home())
+    approval_policy = _normalize_approval_policy(merged_settings)
+    resolved_model = str(merged_settings.get("model") or "").strip() or None
+    try:
+        bound_session_id = await transport.bind_session(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            cwd=resolved_cwd,
+            approval_policy=approval_policy,
+            model=resolved_model,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"Gemini ACP session bind failed: {exc}"}
+    meta["thread_id"] = bound_session_id
+    meta["gemini_acp_session_id"] = bound_session_id
+    meta["gemini_acp_shell_id"] = transport.runtime_instance_id()
+    meta["status"] = "active"
+    persisted_settings = dict(meta.get("settings") or {}) if isinstance(meta.get("settings"), dict) else {}
+    persisted_settings["agent"] = extension_id or "gemini-acp"
+    for key, value in merged_settings.items():
+        if value is None or value == "":
+            persisted_settings.pop(key, None)
+        else:
+            persisted_settings[key] = value
+    meta["settings"] = persisted_settings
+    _save_meta(conversation_id, meta)
+    _ready_extensions.add(extension_id or "gemini-acp")
+    return {
+        "ok": True,
+        "session_id": bound_session_id,
+        "conversation_id": conversation_id,
+    }
+
+
+async def hydrate_transcript(
+    session_id: str,
+    conversation_id: str,
+    cwd: Optional[str] = None,
+    model: Optional[str] = None,
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    transport = _transport
+    if transport is None or not session_id or not conversation_id:
+        return []
+    merged_settings = _merge_runtime_settings(conversation_id, settings=settings)
+    if cwd:
+        merged_settings["cwd"] = cwd
+    if model:
+        merged_settings["model"] = model
+    resolved_cwd = str(merged_settings.get("cwd") or Path.home())
+    approval_policy = _normalize_approval_policy(merged_settings)
+    try:
+        updates = await transport.load_session_history(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            cwd=resolved_cwd,
+            approval_policy=approval_policy,
+        )
+    except Exception as exc:
+        print(f"[GeminiACP] hydrate_transcript failed: {exc}")
+        return []
+    return build_history_transcript_entries(session_id=session_id, updates=updates)
 
 
 async def shutdown_client() -> None:

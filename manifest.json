@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "gemini-acp",
   "name": "Gemini ACP",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "gemini_acp",
   "compat": {
     "app_server_manifest_min": 1,
@@ -16,7 +16,7 @@
     "shellspec": "shellspec/gemini_acp.yaml#gemini_acp_observed"
   },
   "capabilities": {
-    "sessionResume": false,
+    "sessionResume": true,
     "streaming": false,
     "modelListing": true,
     "permissionHandling": true,

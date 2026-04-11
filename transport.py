@@ -18,6 +18,7 @@ from acp.schema import ClientCapabilities, Implementation  # noqa: E402
 
 _TRANSPORT_LABEL = "gemini-acp:extension"
 _MODEL_DISCOVERY_CONVERSATION_ID = "__gemini_acp_model_discovery__"
+_SESSION_LIST_CONVERSATION_ID = "__gemini_acp_session_list__"
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,47 @@ def _normalize_model_entries_from_config_options(config_options: Any) -> tuple[l
         options = _field_value(option, "options")
         return (_normalize_model_entries_from_select_options(options), current_model)
     return ([], None)
+
+
+def _normalize_pathish(value: Any) -> str:
+    text = _string_value(value)
+    if not text:
+        return ""
+    return str(Path(text).expanduser())
+
+
+def _cwd_relevance(session_cwd: str, target_cwd: str) -> int:
+    normalized_session = _normalize_pathish(session_cwd)
+    normalized_target = _normalize_pathish(target_cwd)
+    if not normalized_session or not normalized_target:
+        return 9
+    if normalized_session == normalized_target:
+        return 0
+    target_prefix = normalized_target.rstrip("/") + "/"
+    session_prefix = normalized_session.rstrip("/") + "/"
+    if normalized_session.startswith(target_prefix) or normalized_target.startswith(session_prefix):
+        return 1
+    return 9
+
+
+def _normalize_session_entry(session: Any, *, active: bool = False) -> Optional[dict[str, Any]]:
+    session_id = _string_value(_field_value(session, "session_id", "sessionId", "id"))
+    if not session_id:
+        return None
+    cwd = _string_value(_field_value(session, "cwd"))
+    title = _string_value(_field_value(session, "title", "summary", "name"))
+    updated_at = _string_value(_field_value(session, "updated_at", "updatedAt", "modified_time", "modifiedTime"))
+    entry: dict[str, Any] = {
+        "session_id": session_id,
+        "summary": title or cwd or session_id,
+    }
+    if updated_at:
+        entry["modified_time"] = updated_at
+    if cwd:
+        entry["context"] = {"cwd": cwd}
+    if active:
+        entry["active"] = True
+    return entry
 
 
 class _DrainProtocol(asyncio.Protocol):
@@ -284,6 +326,7 @@ class GeminiACPTransport:
         self._updates_by_conversation: dict[str, list[dict[str, Any]]] = {}
         self._model_options_by_conversation: dict[str, list[dict[str, Any]]] = {}
         self._current_model_by_conversation: dict[str, str] = {}
+        self._agent_capabilities: Any = None
 
     def is_ready(self) -> bool:
         return bool(self._shell_id and self._initialized and self._connection is not None and self._bridge is not None)
@@ -293,6 +336,30 @@ class GeminiACPTransport:
 
     def session_id_for(self, conversation_id: str) -> Optional[str]:
         return self._session_ids_by_conversation.get(conversation_id)
+
+    def _session_capabilities(self) -> Any:
+        capabilities = self._agent_capabilities
+        if capabilities is None:
+            return None
+        return getattr(capabilities, "session_capabilities", None) or getattr(capabilities, "sessionCapabilities", None)
+
+    def supports_load_session(self) -> bool:
+        capabilities = self._agent_capabilities
+        if capabilities is None:
+            return False
+        return bool(getattr(capabilities, "load_session", None) or getattr(capabilities, "loadSession", None))
+
+    def supports_list_sessions(self) -> bool:
+        session_capabilities = self._session_capabilities()
+        if session_capabilities is None:
+            return False
+        return getattr(session_capabilities, "list", None) is not None
+
+    def supports_resume_session(self) -> bool:
+        session_capabilities = self._session_capabilities()
+        if session_capabilities is None:
+            return False
+        return getattr(session_capabilities, "resume", None) is not None
 
     async def stop(self) -> None:
         async with self._lock:
@@ -306,6 +373,7 @@ class GeminiACPTransport:
             self._updates_by_conversation.clear()
             self._model_options_by_conversation.clear()
             self._current_model_by_conversation.clear()
+            self._agent_capabilities = None
             if shell_id:
                 mgr = await self._fws_getter()
                 with contextlib.suppress(Exception):
@@ -344,6 +412,101 @@ class GeminiACPTransport:
                 collected.extend(dict(item) for item in entries if isinstance(item, dict))
         return _dedupe_model_entries(collected)
 
+    def _remember_session_binding(self, conversation_id: str, session_id: str) -> None:
+        previous_session_id = self._session_ids_by_conversation.get(conversation_id)
+        if previous_session_id and previous_session_id != session_id:
+            self._conversation_by_session.pop(previous_session_id, None)
+        previous_conversation_id = self._conversation_by_session.get(session_id)
+        if previous_conversation_id and previous_conversation_id != conversation_id:
+            self._session_ids_by_conversation.pop(previous_conversation_id, None)
+        self._session_ids_by_conversation[conversation_id] = session_id
+        self._conversation_by_session[session_id] = conversation_id
+
+    async def _apply_model_selection(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        model: Optional[str],
+    ) -> None:
+        desired_model = _string_value(model)
+        if not desired_model or self._connection is None:
+            return
+        current_model = self._current_model_by_conversation.get(conversation_id)
+        if desired_model == current_model:
+            return
+        config_error: Optional[Exception] = None
+        try:
+            response = await self._connection.set_config_option(
+                config_id="model",
+                session_id=session_id,
+                value=desired_model,
+            )
+            self._remember_session_configuration(
+                conversation_id,
+                config_options=getattr(response, "config_options", None),
+            )
+            current_model = self._current_model_by_conversation.get(conversation_id)
+            if current_model == desired_model:
+                return
+        except Exception as exc:
+            config_error = exc
+        try:
+            await self._connection.set_session_model(model_id=desired_model, session_id=session_id)
+            self._current_model_by_conversation[conversation_id] = desired_model
+        except Exception as exc:
+            if config_error is not None:
+                raise RuntimeError(
+                    f"Failed to select Gemini model {desired_model}: {config_error}; fallback set_session_model also failed: {exc}"
+                ) from exc
+            raise RuntimeError(f"Failed to select Gemini model {desired_model}: {exc}") from exc
+
+    async def _bind_existing_session(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        cwd: str,
+        model: Optional[str] = None,
+    ) -> str:
+        if self._connection is None:
+            raise RuntimeError("Gemini ACP connection not initialized")
+        self._remember_session_binding(conversation_id, session_id)
+        bind_response: Any = None
+        resume_error: Optional[Exception] = None
+        try:
+            bind_response = await self._connection.resume_session(
+                cwd=cwd,
+                session_id=session_id,
+                mcp_servers=[],
+            )
+        except Exception as exc:
+            resume_error = exc
+        if bind_response is None:
+            try:
+                bind_response = await self._connection.load_session(
+                    cwd=cwd,
+                    session_id=session_id,
+                    mcp_servers=[],
+                )
+            except Exception as exc:
+                if resume_error is not None:
+                    raise RuntimeError(
+                        f"Gemini ACP session resume failed: {resume_error}; session load fallback also failed: {exc}"
+                    ) from exc
+                raise RuntimeError(f"Gemini ACP session load failed: {exc}") from exc
+        self._remember_session_configuration(
+            conversation_id,
+            models=getattr(bind_response, "models", None),
+            config_options=getattr(bind_response, "config_options", None),
+        )
+        await self._apply_model_selection(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            model=model,
+        )
+        return session_id
+
     async def ensure_session(
         self,
         *,
@@ -351,27 +514,35 @@ class GeminiACPTransport:
         cwd: str,
         approval_policy: str,
         model: Optional[str] = None,
+        existing_session_id: Optional[str] = None,
     ) -> str:
         await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("Gemini ACP connection not initialized")
+            bound_session_id = _string_value(existing_session_id)
             session_id = self._session_ids_by_conversation.get(conversation_id)
+            if bound_session_id and session_id != bound_session_id:
+                return await self._bind_existing_session(
+                    conversation_id=conversation_id,
+                    session_id=bound_session_id,
+                    cwd=cwd,
+                    model=model,
+                )
             if not session_id:
                 session = await self._connection.new_session(cwd=cwd, mcp_servers=[])
                 session_id = str(session.session_id)
-                self._session_ids_by_conversation[conversation_id] = session_id
-                self._conversation_by_session[session_id] = conversation_id
+                self._remember_session_binding(conversation_id, session_id)
                 self._remember_session_configuration(
                     conversation_id,
                     models=getattr(session, "models", None),
                     config_options=getattr(session, "config_options", None),
                 )
-            desired_model = _string_value(model)
-            current_model = self._current_model_by_conversation.get(conversation_id)
-            if desired_model and desired_model != current_model:
-                await self._connection.set_session_model(model_id=desired_model, session_id=session_id)
-                self._current_model_by_conversation[conversation_id] = desired_model
+            await self._apply_model_selection(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                model=model,
+            )
             return session_id
 
     async def list_models(self, *, cwd: str) -> list[dict[str, Any]]:
@@ -386,6 +557,92 @@ class GeminiACPTransport:
         async with self._lock:
             return self._known_model_options()
 
+    async def list_sessions(self, *, cwd: Optional[str] = None) -> list[dict[str, Any]]:
+        target_cwd = _normalize_pathish(cwd) or str(Path.home())
+        await self.ensure_ready(
+            conversation_id=_SESSION_LIST_CONVERSATION_ID,
+            cwd=target_cwd,
+            approval_policy="cancel",
+        )
+        async with self._lock:
+            if self._connection is None:
+                raise RuntimeError("Gemini ACP connection not initialized")
+            cursor: Optional[str] = None
+            items: list[dict[str, Any]] = []
+            while True:
+                response = await self._connection.list_sessions(cursor=cursor, cwd=target_cwd if cwd else None)
+                sessions = getattr(response, "sessions", None)
+                if isinstance(sessions, list):
+                    for session in sessions:
+                        entry = _normalize_session_entry(
+                            session,
+                            active=_string_value(_field_value(session, "session_id", "sessionId", "id"))
+                            in self._conversation_by_session,
+                        )
+                        if entry:
+                            items.append(entry)
+                cursor = _string_value(getattr(response, "next_cursor", None) or getattr(response, "nextCursor", None))
+                if not cursor:
+                    break
+            items.sort(key=lambda item: str(item.get("modified_time") or ""), reverse=True)
+            if cwd:
+                items.sort(
+                    key=lambda item: _cwd_relevance(
+                        _field_value(item.get("context") or {}, "cwd") or "",
+                        target_cwd,
+                    )
+                )
+            return items
+
+    async def bind_session(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        cwd: str,
+        approval_policy: str,
+        model: Optional[str] = None,
+    ) -> str:
+        await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
+        async with self._lock:
+            return await self._bind_existing_session(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                cwd=cwd,
+                model=model,
+            )
+
+    async def load_session_history(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        cwd: str,
+        approval_policy: str,
+    ) -> list[dict[str, Any]]:
+        await self.ensure_ready(conversation_id=conversation_id, cwd=cwd, approval_policy=approval_policy)
+        async with self._lock:
+            if self._connection is None:
+                raise RuntimeError("Gemini ACP connection not initialized")
+            self._remember_session_binding(conversation_id, session_id)
+            self._updates_by_conversation[conversation_id] = []
+            try:
+                response = await self._connection.load_session(
+                    cwd=cwd,
+                    session_id=session_id,
+                    mcp_servers=[],
+                )
+            except Exception:
+                self._updates_by_conversation.pop(conversation_id, None)
+                raise
+            updates = list(self._updates_by_conversation.pop(conversation_id, []))
+            self._remember_session_configuration(
+                conversation_id,
+                models=getattr(response, "models", None),
+                config_options=getattr(response, "config_options", None),
+            )
+            return updates
+
     async def send_prompt(
         self,
         *,
@@ -395,12 +652,14 @@ class GeminiACPTransport:
         approval_policy: str,
         model: Optional[str] = None,
         message_id: Optional[str] = None,
+        existing_session_id: Optional[str] = None,
     ) -> GeminiPromptResult:
         session_id = await self.ensure_session(
             conversation_id=conversation_id,
             cwd=cwd,
             approval_policy=approval_policy,
             model=model,
+            existing_session_id=existing_session_id,
         )
         async with self._lock:
             if self._connection is None:
@@ -466,6 +725,7 @@ class GeminiACPTransport:
                 await self._connection.close()
         self._connection = None
         self._client = None
+        self._agent_capabilities = None
         bridge = self._bridge
         self._bridge = None
         if bridge is not None:
@@ -481,8 +741,8 @@ class GeminiACPTransport:
             on_update=self._handle_update,
             approval_policy_resolver=self._approval_policy_for_session,
         )
-        connection = connect_to_agent(client, writer, reader)
-        await connection.initialize(
+        connection = connect_to_agent(client, writer, reader, use_unstable_protocol=True)
+        initialize_response = await connection.initialize(
             protocol_version=PROTOCOL_VERSION,
             client_capabilities=ClientCapabilities(),
             client_info=Implementation(name="gemini-acp-extension", title="Gemini ACP Extension", version="0.1.0"),
@@ -490,6 +750,10 @@ class GeminiACPTransport:
         self._bridge = bridge
         self._client = client
         self._connection = connection
+        self._agent_capabilities = (
+            getattr(initialize_response, "agent_capabilities", None)
+            or getattr(initialize_response, "agentCapabilities", None)
+        )
         self._initialized = True
 
     async def _pipe_available(self, shell_id: str) -> bool:
@@ -554,6 +818,7 @@ class GeminiACPTransport:
         self._updates_by_conversation.clear()
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
+        self._agent_capabilities = None
         with contextlib.suppress(Exception):
             await mgr.terminate_shell(shell_id, force=True)
         new_shell_id = await self._start_new_shell(mgr, conversation_id)
@@ -571,3 +836,4 @@ class GeminiACPTransport:
         self._updates_by_conversation.clear()
         self._model_options_by_conversation.clear()
         self._current_model_by_conversation.clear()
+        self._agent_capabilities = None

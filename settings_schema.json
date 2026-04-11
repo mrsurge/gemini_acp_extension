@@ -26,6 +26,14 @@
       "browse": true
     },
     {
+      "id": "session",
+      "type": "session_picker",
+      "label": "Session",
+      "placeholder": "(new session) or type/paste session ID",
+      "source": "/api/extensions/gemini-acp/sessions",
+      "resume_endpoint": "/api/extensions/gemini-acp/sessions/resume"
+    },
+    {
       "id": "model",
       "type": "select",
       "label": "Model",

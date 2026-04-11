@@ -65,33 +65,52 @@ def _content_text(content: Any) -> str:
     return ""
 
 
-def _collect_assistant_messages(updates: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def _message_role_for_update(kind: str) -> Optional[str]:
+    normalized = kind.strip()
+    if normalized == "user_message_chunk":
+        return "user"
+    if normalized == "agent_message_chunk":
+        return "assistant"
+    if normalized == "agent_thought_chunk":
+        return "reasoning"
+    return None
+
+
+def _collect_message_updates(updates: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = []
+    current_kind: Optional[str] = None
     current_message_id: Optional[str] = None
     current_parts: List[str] = []
 
     def flush() -> None:
-        nonlocal current_message_id, current_parts
+        nonlocal current_kind, current_message_id, current_parts
+        role = _message_role_for_update(current_kind or "")
         text = "".join(current_parts).strip()
-        if text:
-            item: Dict[str, str] = {"text": text}
+        if role and text:
+            item: Dict[str, str] = {"role": role, "text": text}
             if current_message_id:
                 item["message_id"] = current_message_id
             messages.append(item)
+        current_kind = None
         current_message_id = None
         current_parts = []
 
     for payload in updates:
         kind = _session_update_kind(payload)
-        if kind != "agent_message_chunk":
+        role = _message_role_for_update(kind)
+        if role is None:
             flush()
             continue
         message_id_raw = payload.get("messageId")
         if not isinstance(message_id_raw, str) or not message_id_raw.strip():
             message_id_raw = payload.get("message_id")
         message_id = message_id_raw.strip() if isinstance(message_id_raw, str) and message_id_raw.strip() else None
-        if current_parts and message_id and current_message_id and message_id != current_message_id:
+        if current_parts and (
+            kind != current_kind or (message_id and current_message_id and message_id != current_message_id)
+        ):
             flush()
+        if current_kind is None:
+            current_kind = kind
         if current_message_id is None and message_id:
             current_message_id = message_id
         text = _content_text(payload.get("content"))
@@ -99,6 +118,10 @@ def _collect_assistant_messages(updates: List[Dict[str, Any]]) -> List[Dict[str,
             current_parts.append(text)
     flush()
     return messages
+
+
+def _collect_assistant_messages(updates: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    return [item for item in _collect_message_updates(updates) if item.get("role") == "assistant"]
 
 
 def _debug_trace_entries(
@@ -231,6 +254,29 @@ def build_prompt_turn_output(
         "events": events,
         "transcript_entries": transcript_entries,
     }
+
+
+def build_history_transcript_entries(
+    *,
+    session_id: str,
+    updates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    transcript_entries: List[Dict[str, Any]] = []
+    for index, message in enumerate(_collect_message_updates(updates), start=1):
+        role = str(message.get("role") or "").strip()
+        text = str(message.get("text") or "").strip()
+        if not role or not text:
+            continue
+        message_id = str(message.get("message_id") or f"{session_id}:history:{role}:{index}")
+        transcript_entries.append(
+            _build_message_transcript_entry(
+                turn_id=f"{session_id}:history:{index}",
+                message_id=message_id,
+                role=role,
+                text=text,
+            )
+        )
+    return transcript_entries
 
 
 async def route_event(
