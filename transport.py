@@ -17,7 +17,7 @@ from .vendor_sdk import ensure_sdk_on_path
 ensure_sdk_on_path()
 
 from acp import PROTOCOL_VERSION, RequestError, connect_to_agent, text_block  # noqa: E402
-from acp.schema import ClientCapabilities, Implementation  # noqa: E402
+from acp.schema import ClientCapabilities, DeniedOutcome, Implementation, RequestPermissionResponse  # noqa: E402
 
 _TRANSPORT_LABEL = "gemini-acp:extension"
 _MODEL_DISCOVERY_CONVERSATION_ID = "__gemini_acp_model_discovery__"
@@ -39,6 +39,7 @@ class GeminiPromptResult:
 
 
 LiveUpdateCallback = Callable[[dict[str, Any]], Any]
+PermissionRequestCallback = Callable[[str, str, list[Any], Any], Awaitable[RequestPermissionResponse]]
 
 
 def _field_value(value: Any, *names: str) -> Any:
@@ -365,6 +366,7 @@ class GeminiACPTransport:
         self._live_update_callbacks: dict[str, LiveUpdateCallback] = {}
         self._live_update_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._suppressed_update_counts: dict[str, int] = {}
+        self._permission_request_callback: Optional[PermissionRequestCallback] = None
 
     def is_ready(self) -> bool:
         return bool(self._shell_id and self._initialized and self._connection is not None and self._bridge is not None)
@@ -374,6 +376,15 @@ class GeminiACPTransport:
 
     def session_id_for(self, conversation_id: str) -> Optional[str]:
         return self._session_ids_by_conversation.get(conversation_id)
+
+    def conversation_id_for_session(self, session_id: str) -> Optional[str]:
+        return self._conversation_by_session.get(session_id)
+
+    def set_permission_request_callback(
+        self,
+        callback: Optional[PermissionRequestCallback],
+    ) -> None:
+        self._permission_request_callback = callback
 
     def _session_capabilities(self) -> Any:
         capabilities = self._agent_capabilities
@@ -948,11 +959,32 @@ class GeminiACPTransport:
                     self._remember_session_binding(conversation_id, bound_session_id)
             return result
 
-    def _approval_policy_for_session(self, session_id: str) -> str:
+    async def _handle_permission_request(
+        self,
+        options: list[Any],
+        session_id: str,
+        tool_call: Any,
+    ) -> RequestPermissionResponse:
         conversation_id = self._conversation_by_session.get(session_id)
-        if not conversation_id:
-            return "cancel"
-        return self._approval_policy_by_conversation.get(conversation_id, "cancel")
+        callback = self._permission_request_callback
+        if conversation_id and callback is not None:
+            return await callback(conversation_id, session_id, options, tool_call)
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+    async def cancel_session(self, conversation_id: str) -> bool:
+        session_id = self._session_ids_by_conversation.get(conversation_id)
+        if not session_id:
+            return False
+        await self.ensure_ready(
+            conversation_id=conversation_id,
+            cwd=self._launch_cwd,
+            approval_policy=self._approval_policy_by_conversation.get(conversation_id, "auto_deny"),
+        )
+        async with self._lock:
+            if self._connection is None:
+                raise RuntimeError("Gemini ACP connection not initialized")
+            await self._connection.cancel(session_id)
+            return True
 
     def _handle_update(self, session_id: str, payload: dict[str, Any]) -> None:
         conversation_id = self._conversation_by_session.get(session_id)
@@ -1000,7 +1032,7 @@ class GeminiACPTransport:
         reader, writer = await bridge.start()
         client = GeminiACPBridgeClient(
             on_update=self._handle_update,
-            approval_policy_resolver=self._approval_policy_for_session,
+            on_request_permission=self._handle_permission_request,
         )
         connection = connect_to_agent(client, writer, reader, use_unstable_protocol=True)
         initialize_response = await connection.initialize(

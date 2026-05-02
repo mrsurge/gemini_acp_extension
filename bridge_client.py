@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .vendor_sdk import ensure_sdk_on_path
 
@@ -12,7 +12,7 @@ from acp import RequestError  # noqa: E402
 from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse  # noqa: E402
 
 UpdateCallback = Callable[[str, dict[str, Any]], None]
-ApprovalPolicyResolver = Callable[[str], str]
+PermissionRequestHandler = Callable[[list[Any], str, Any], Awaitable[RequestPermissionResponse]]
 
 
 class GeminiACPBridgeClient:
@@ -20,11 +20,11 @@ class GeminiACPBridgeClient:
         self,
         *,
         on_update: Optional[UpdateCallback] = None,
-        approval_policy_resolver: Optional[ApprovalPolicyResolver] = None,
+        on_request_permission: Optional[PermissionRequestHandler] = None,
     ) -> None:
         self._conn: Any = None
         self._on_update = on_update
-        self._approval_policy_resolver = approval_policy_resolver or (lambda _session_id: "cancel")
+        self._on_request_permission = on_request_permission
 
     def on_connect(self, conn: Any) -> None:
         self._conn = conn
@@ -40,14 +40,9 @@ class GeminiACPBridgeClient:
         self._on_update(session_id, payload)
 
     async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> RequestPermissionResponse:
-        del tool_call, kwargs
-        approval_policy = self._approval_policy_resolver(session_id)
-        if approval_policy == "auto-approve":
-            preferred = _pick_preferred_option(options)
-            if preferred is not None:
-                return RequestPermissionResponse(
-                    outcome=AllowedOutcome(option_id=str(preferred.option_id), outcome="selected")
-                )
+        del kwargs
+        if self._on_request_permission is not None:
+            return await self._on_request_permission(options, session_id, tool_call)
         return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
     async def write_text_file(self, content: str, path: str, session_id: str, **kwargs: Any) -> Any:
@@ -93,11 +88,3 @@ class GeminiACPBridgeClient:
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         del method, params
-
-
-def _pick_preferred_option(options: list[Any]) -> Any | None:
-    for option in options:
-        option_kind = str(getattr(option, "kind", "")).strip().lower()
-        if option_kind in {"allow_once", "allow", "allow_always", "allow_always_and_save"}:
-            return option
-    return options[0] if options else None

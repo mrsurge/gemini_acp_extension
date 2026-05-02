@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "gemini-acp",
   "name": "Gemini ACP",
-  "version": "0.1.3",
+  "version": "0.1.6",
   "type": "gemini_acp",
   "compat": {
     "app_server_manifest_min": 1,
@@ -16,7 +16,7 @@
     "shellspec": "shellspec/gemini_acp.yaml#gemini_acp_observed"
   },
   "capabilities": {
-    "sessionResume": true,
+    "sessionResume": false,
     "streaming": false,
     "modelListing": true,
     "permissionHandling": true,
@@ -36,6 +36,18 @@
     "color": "#4285f4",
     "semanticShellRibbon": {
       "quoteParsing": false
-    }
+    },
+    "requestCards": [
+      {
+        "id": "gemini-acp-permission-request",
+        "module": "ui/request_cards/gemini_request_card.js",
+        "export": "renderRequestCard",
+        "matches": [
+          {
+            "requestMethod": "gemini-acp/permission"
+          }
+        ]
+      }
+    ]
   }
 }

@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import approval_state as approval_sm
 from .dependencies import check_dependencies
 from .router import GeminiLiveTurnAccumulator, build_history_transcript_entries, build_user_turn_output, utc_ts
 from .transport import GeminiACPTransport
+from .vendor_sdk import ensure_sdk_on_path
+
+ensure_sdk_on_path()
+
+from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse  # noqa: E402
 
 _broadcast_fn: Optional[Callable[..., Any]] = None
 _transcript_fn: Optional[Callable[..., Any]] = None
@@ -19,15 +26,11 @@ _registered_extension_ids: set[str] = set()
 _ready_extensions: set[str] = set()
 _transport: Optional[GeminiACPTransport] = None
 _EXTENSION_ROOT = Path(__file__).parent
-_DEFAULT_APPROVAL_POLICY = "cancel"
-_DEFAULT_SANDBOX_POLICY = "agent-default"
-_APPROVAL_POLICY_OPTIONS = [
-    {"value": "cancel", "label": "Cancel all requests"},
-    {"value": "auto-approve", "label": "Auto-approve first allow option"},
-]
-_SANDBOX_POLICY_OPTIONS = [
-    {"value": "agent-default", "label": "Gemini default (not normalized yet)"},
-]
+_GEMINI_PERMISSION_REQUEST_METHOD = "gemini-acp/permission"
+_pending_approvals: Dict[str, asyncio.Future[object]] = {}
+_pending_request_specs: Dict[str, Dict[str, Any]] = {}
+_pending_approval_conversations: Dict[str, str] = {}
+_active_turn_ids: Dict[str, str] = {}
 
 
 def init_gemini_acp_manager(
@@ -48,6 +51,7 @@ def init_gemini_acp_manager(
         ext_id for ext_id in (registered_extension_ids or []) if isinstance(ext_id, str) and ext_id
     }
     _transport = GeminiACPTransport(extension_root=_EXTENSION_ROOT, fws_getter=fws_getter)
+    _transport.set_permission_request_callback(_handle_permission_request)
     print("[GeminiACP] Scaffold transport initialized")
 
 
@@ -85,6 +89,416 @@ def _save_meta(conversation_id: str, meta: Dict[str, Any]) -> None:
         saver(conversation_id, meta)
 
 
+def _upsert_pending_approval(conversation_id: str, descriptor: Dict[str, Any]) -> None:
+    if _meta_fns and "upsert_pending_approval" in _meta_fns:
+        _meta_fns["upsert_pending_approval"](conversation_id, descriptor)
+        return
+    if _meta_fns and "load" in _meta_fns and "save" in _meta_fns:
+        meta = _meta_fns["load"](conversation_id)
+        pending = meta.get("pending_approvals") if isinstance(meta.get("pending_approvals"), dict) else {}
+        pending[str(descriptor.get("request_id") or "")] = descriptor
+        meta["pending_approvals"] = pending
+        _meta_fns["save"](conversation_id, meta)
+
+
+def _remove_pending_approval(conversation_id: str, request_id: str) -> None:
+    if _meta_fns and "remove_pending_approval" in _meta_fns:
+        _meta_fns["remove_pending_approval"](conversation_id, request_id)
+        return
+    if _meta_fns and "load" in _meta_fns and "save" in _meta_fns:
+        meta = _meta_fns["load"](conversation_id)
+        pending = meta.get("pending_approvals") if isinstance(meta.get("pending_approvals"), dict) else {}
+        pending.pop(str(request_id or ""), None)
+        meta["pending_approvals"] = pending
+        _meta_fns["save"](conversation_id, meta)
+
+
+def _jsonish_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return _jsonish_value(value.model_dump(mode="json", by_alias=True))
+    if isinstance(value, dict):
+        return {str(key): _jsonish_value(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_jsonish_value(item) for item in value]
+    return value
+
+
+def _object_dict(value: Any) -> Dict[str, Any]:
+    converted = _jsonish_value(value)
+    return dict(converted) if isinstance(converted, dict) else {}
+
+
+def _string_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _tool_call_id(tool_call: Dict[str, Any]) -> str:
+    return _string_value(tool_call.get("toolCallId") or tool_call.get("tool_call_id"))
+
+
+def _tool_call_kind(tool_call: Dict[str, Any]) -> str:
+    return _string_value(tool_call.get("kind")) or "permission"
+
+
+def _tool_call_title(tool_call: Dict[str, Any]) -> str:
+    return _string_value(tool_call.get("title"))
+
+
+def _display_tool_name(tool_call: Dict[str, Any]) -> str:
+    tool_kind = _tool_call_kind(tool_call).lower()
+    if tool_kind == "edit":
+        return "apply_patch"
+    return tool_kind or "tool"
+
+
+def _tool_call_locations(tool_call: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = tool_call.get("locations")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in (_object_dict(entry) for entry in raw) if item]
+
+
+def _permission_option_id(option: Any) -> str:
+    if hasattr(option, "option_id"):
+        return _string_value(getattr(option, "option_id"))
+    if hasattr(option, "optionId"):
+        return _string_value(getattr(option, "optionId"))
+    return _string_value(_object_dict(option).get("optionId") or _object_dict(option).get("option_id"))
+
+
+def _permission_option_kind(option: Any) -> str:
+    if hasattr(option, "kind"):
+        return _string_value(getattr(option, "kind")).lower()
+    return _string_value(_object_dict(option).get("kind")).lower()
+
+
+def _permission_option_name(option: Any) -> str:
+    if hasattr(option, "name"):
+        return _string_value(getattr(option, "name"))
+    return _string_value(_object_dict(option).get("name"))
+
+
+def _normalize_permission_options(options: List[Any]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for option in options:
+        option_id = _permission_option_id(option)
+        option_kind = _permission_option_kind(option)
+        option_name = _permission_option_name(option)
+        if not option_id or not option_kind:
+            continue
+        normalized.append({
+            "optionId": option_id,
+            "kind": option_kind,
+            "name": option_name or option_kind,
+        })
+    return normalized
+
+
+def _pick_option_by_kind(
+    options: List[Dict[str, str]],
+    preferred_kinds: List[str],
+) -> Optional[Dict[str, str]]:
+    for option_kind in preferred_kinds:
+        for option in options:
+            if option.get("kind") == option_kind:
+                return option
+    return None
+
+
+def _selected_option_response(option: Dict[str, str]) -> RequestPermissionResponse:
+    return RequestPermissionResponse(
+        outcome=AllowedOutcome(
+            option_id=str(option.get("optionId") or ""),
+            outcome="selected",
+        )
+    )
+
+
+def _cancelled_permission_response() -> RequestPermissionResponse:
+    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+
+def _auto_permission_resolution(
+    state: Dict[str, Any],
+    options: List[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    normalized_state = approval_sm.normalize_state(state)
+    policy = _string_value(normalized_state.get("policy"))
+    option: Optional[Dict[str, str]] = None
+    if policy == approval_sm.POLICY_ALWAYS_APPROVE:
+        option = _pick_option_by_kind(options, ["allow_always", "allow_once"])
+    elif policy == approval_sm.POLICY_ALWAYS_REJECT:
+        option = _pick_option_by_kind(options, ["reject_always", "reject_once"])
+        if option is None:
+            return {
+                "response": _cancelled_permission_response(),
+                "next_state": approval_sm.after_serving_request(normalized_state),
+            }
+    elif policy == approval_sm.POLICY_ASK and normalized_state.get("ask_session_approved") is True:
+        option = _pick_option_by_kind(options, ["allow_always", "allow_once"])
+    if option is None:
+        return None
+    return {
+        "response": _selected_option_response(option),
+        "next_state": approval_sm.after_serving_request(normalized_state),
+    }
+
+
+def _decision_string(resolution: object) -> str:
+    if isinstance(resolution, dict):
+        for key in ("decision", "action", "kind"):
+            value = resolution.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _manual_permission_resolution(
+    resolution: object,
+    request_spec: Dict[str, Any],
+) -> Dict[str, Any]:
+    options = [
+        dict(item)
+        for item in request_spec.get("options", [])
+        if isinstance(item, dict)
+    ]
+    current_state = approval_sm.normalize_state(request_spec.get("current_state"))
+    decision = _decision_string(resolution)
+    option: Optional[Dict[str, str]] = None
+    next_state: Dict[str, Any] = current_state
+    if decision == "acceptForSession":
+        option = _pick_option_by_kind(options, ["allow_always", "allow_once"])
+        next_state = {
+            "policy": approval_sm.POLICY_ASK,
+            "ask_session_approved": True,
+        }
+    elif decision == "accept":
+        option = _pick_option_by_kind(options, ["allow_once", "allow_always"])
+        next_state = {
+            "policy": approval_sm.POLICY_ASK,
+            "ask_session_approved": False,
+        }
+    elif decision in {"decline", "reject"}:
+        option = _pick_option_by_kind(options, ["reject_once", "reject_always"])
+        next_state = {
+            "policy": approval_sm.POLICY_ASK,
+            "ask_session_approved": False,
+        }
+    elif decision == "cancel":
+        return {
+            "response": _cancelled_permission_response(),
+            "next_state": current_state,
+        }
+    if option is None:
+        return {
+            "response": _cancelled_permission_response(),
+            "next_state": current_state,
+        }
+    return {
+        "response": _selected_option_response(option),
+        "next_state": approval_sm.after_serving_request(next_state),
+    }
+
+
+def _persist_manual_permission_state(
+    request_spec: Dict[str, Any],
+    result: Dict[str, Any],
+) -> None:
+    conversation_id = _string_value(request_spec.get("conversation_id"))
+    next_state = result.get("next_state")
+    if conversation_id and isinstance(next_state, dict):
+        _persist_approval_state(conversation_id, next_state)
+
+
+def _cancel_pending_approvals_for_conversation(conversation_id: str) -> None:
+    for request_id, request_conversation_id in tuple(_pending_approval_conversations.items()):
+        if request_conversation_id != conversation_id:
+            continue
+        pending_future = _pending_approvals.pop(request_id, None)
+        _pending_request_specs.pop(request_id, None)
+        _pending_approval_conversations.pop(request_id, None)
+        _remove_pending_approval(conversation_id, request_id)
+        if isinstance(pending_future, asyncio.Future) and not pending_future.done():
+            pending_future.set_result({
+                "response": _cancelled_permission_response(),
+                "next_state": None,
+            })
+
+
+def _render_diff(path: str, old_text: Optional[str], new_text: str) -> str:
+    target_path = path or "file"
+    before_lines = old_text.splitlines() if isinstance(old_text, str) else []
+    after_lines = new_text.splitlines()
+    from_file = f"a/{target_path}" if isinstance(old_text, str) else "/dev/null"
+    to_file = f"b/{target_path}"
+    return "\n".join(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=from_file,
+            tofile=to_file,
+            lineterm="",
+        )
+    )
+
+
+def _tool_call_diff_changes(tool_call: Dict[str, Any]) -> List[Dict[str, str]]:
+    contents = tool_call.get("content")
+    if not isinstance(contents, list):
+        return []
+    changes: List[Dict[str, str]] = []
+    for entry in contents:
+        content = _object_dict(entry)
+        if content.get("type") != "diff":
+            continue
+        path = _string_value(content.get("path"))
+        new_text = content.get("newText")
+        if not isinstance(new_text, str):
+            continue
+        old_text_raw = content.get("oldText")
+        old_text = old_text_raw if isinstance(old_text_raw, str) else None
+        diff_text = _render_diff(path, old_text, new_text)
+        changes.append({
+            "path": path,
+            "diff": diff_text,
+            "unified_diff": diff_text,
+        })
+    return changes
+
+
+def _tool_call_path(tool_call: Dict[str, Any], raw_input: Dict[str, Any], locations: List[Dict[str, Any]]) -> str:
+    if locations:
+        path = _string_value(locations[0].get("path"))
+        if path:
+            return path
+    for key in ("path", "file_path", "filePath", "target", "destination"):
+        value = raw_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _approval_payload_for_tool_call(
+    conversation_id: str,
+    session_id: str,
+    tool_call: Dict[str, Any],
+    options: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    tool_kind = _tool_call_kind(tool_call)
+    tool_name = _display_tool_name(tool_call)
+    title = _tool_call_title(tool_call)
+    raw_input = _object_dict(tool_call.get("rawInput"))
+    locations = _tool_call_locations(tool_call)
+    path = _tool_call_path(tool_call, raw_input, locations)
+    changes = _tool_call_diff_changes(tool_call)
+    possible_paths: List[str] = []
+    for location in locations:
+        candidate = _string_value(location.get("path"))
+        if candidate and candidate not in possible_paths:
+            possible_paths.append(candidate)
+    payload: Dict[str, Any] = {
+        "kind": tool_kind,
+        "message": title or f"Gemini ACP requests permission for {tool_kind}",
+        "intention": title or f"Gemini ACP requests permission for {tool_kind}",
+        "tool_name": tool_name,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "arguments": raw_input,
+        "request": raw_input,
+    }
+    if path:
+        payload["path"] = path
+    command = raw_input.get("command")
+    if isinstance(command, str) and command.strip():
+        payload["command"] = command.strip()
+    elif isinstance(command, list):
+        payload["command"] = [str(item) for item in command if str(item).strip()]
+    cwd = raw_input.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        payload["cwd"] = cwd.strip()
+    if changes:
+        payload["changes"] = changes
+        payload["diff"] = changes[0].get("diff") or ""
+        if not payload.get("path"):
+            payload["path"] = changes[0].get("path") or ""
+    if possible_paths:
+        payload["possible_paths"] = possible_paths
+    if any(option.get("kind") == "allow_always" for option in options):
+        payload["can_offer_session_approval"] = True
+    return payload
+
+
+def _approval_kind_for_tool_call(tool_call: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    if payload.get("diff") or payload.get("changes"):
+        return "diff"
+    return _tool_call_kind(tool_call)
+
+
+def _build_permission_descriptor(
+    conversation_id: str,
+    session_id: str,
+    request_id: str,
+    tool_call: Dict[str, Any],
+    options: List[Dict[str, str]],
+    current_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    turn_id = _active_turn_ids.get(conversation_id, "")
+    payload = _approval_payload_for_tool_call(conversation_id, session_id, tool_call, options)
+    kind = _approval_kind_for_tool_call(tool_call, payload)
+    request_params: Dict[str, Any] = {
+        "sessionId": session_id,
+        "toolCallId": _tool_call_id(tool_call),
+        "options": [dict(item) for item in options],
+        "kind": kind,
+        "tool_name": payload.get("tool_name"),
+        "intention": payload.get("intention"),
+        "request": payload.get("request"),
+        "arguments": payload.get("arguments"),
+        "command": payload.get("command"),
+        "cwd": payload.get("cwd"),
+        "path": payload.get("path"),
+        "changes": payload.get("changes"),
+        "diff": payload.get("diff"),
+        "possible_paths": payload.get("possible_paths"),
+        "availableDecisions": (
+            ["accept", "acceptForSession", "decline"]
+            if payload.get("can_offer_session_approval")
+            else ["accept", "decline"]
+        ),
+        "currentApprovalPolicy": approval_sm.runtime_current_value(current_state),
+    }
+    created_at = utc_ts()
+    render_event: Dict[str, Any] = {
+        "type": "approval",
+        "conversation_id": conversation_id,
+        "id": request_id,
+        "request_id": request_id,
+        "kind": kind,
+        "payload": payload,
+        "turn_id": turn_id,
+        "request_method": _GEMINI_PERMISSION_REQUEST_METHOD,
+        "request_params": request_params,
+        "created_at": created_at,
+    }
+    return {
+        "request_id": request_id,
+        "agent": "gemini-acp",
+        "kind": kind,
+        "payload": payload,
+        "request_method": _GEMINI_PERMISSION_REQUEST_METHOD,
+        "request_params": request_params,
+        "thread_id": session_id,
+        "turn_id": turn_id,
+        "runtime_signature": _transport.runtime_instance_id() if _transport is not None else None,
+        "runtime_instance_id": _transport.runtime_instance_id() if _transport is not None else None,
+        "transcript_anchor": {"turn_id": turn_id},
+        "source": "live",
+        "created_at": created_at,
+        "current_state": approval_sm.normalize_state(current_state),
+        "render_event": render_event,
+    }
+
+
 def _bound_session_id(meta: Dict[str, Any]) -> Optional[str]:
     for key in ("thread_id", "gemini_acp_session_id"):
         raw = meta.get(key)
@@ -106,18 +520,56 @@ def _merge_runtime_settings(conversation_id: str, settings: Optional[Dict[str, A
 
 
 def _normalize_approval_policy(settings: Dict[str, Any]) -> str:
-    raw = settings.get("approval_policy")
-    if raw is None:
-        raw = settings.get("approval_mode")
-    value = str(raw or _DEFAULT_APPROVAL_POLICY).strip()
-    allowed = {item["value"] for item in _APPROVAL_POLICY_OPTIONS}
-    return value if value in allowed else _DEFAULT_APPROVAL_POLICY
+    """Return the top-level approval policy string used by the transport layer.
+
+    Derived from the harness policy state machine; pure function over `settings`
+    so callers that only need a transport-friendly hint can stay unchanged.
+    """
+    state = approval_sm.state_from_setting(
+        settings.get("approval_policy") or settings.get("approval_mode")
+    )
+    return approval_sm.setting_from_state(state)
 
 
-def _normalize_sandbox_policy(settings: Dict[str, Any]) -> str:
-    value = str(settings.get("sandbox_policy") or _DEFAULT_SANDBOX_POLICY).strip()
-    allowed = {item["value"] for item in _SANDBOX_POLICY_OPTIONS}
-    return value if value in allowed else _DEFAULT_SANDBOX_POLICY
+def _approval_state_for_conversation(
+    conversation_id: str,
+    merged_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve the live approval state for a conversation.
+
+    Order of precedence:
+      1. Persisted state in conversation meta (`approval_policy_state`).
+      2. Initial state derived from the merged settings field.
+      3. Module default.
+    """
+    setting_value = merged_settings.get("approval_policy") or merged_settings.get("approval_mode")
+    if conversation_id:
+        meta = _load_meta(conversation_id)
+        if setting_value == approval_sm.SETTING_ASK_CLEAR:
+            meta[approval_sm.META_KEY] = approval_sm.state_from_setting(approval_sm.POLICY_ASK)
+            meta_settings = meta.get("settings")
+            if isinstance(meta_settings, dict):
+                changed = False
+                for key in ("approval_policy", "approval_mode"):
+                    if meta_settings.get(key) == approval_sm.SETTING_ASK_CLEAR:
+                        meta_settings[key] = approval_sm.POLICY_ASK
+                        changed = True
+                if changed:
+                    meta["settings"] = meta_settings
+            _save_meta(conversation_id, meta)
+            return approval_sm.state_from_setting(approval_sm.POLICY_ASK)
+        persisted = meta.get(approval_sm.META_KEY)
+        if isinstance(persisted, dict):
+            return approval_sm.apply_setting_override(persisted, setting_value)
+    return approval_sm.state_from_setting(setting_value)
+
+
+def _persist_approval_state(conversation_id: str, state: Dict[str, Any]) -> None:
+    if not conversation_id:
+        return
+    meta = _load_meta(conversation_id)
+    meta[approval_sm.META_KEY] = approval_sm.normalize_state(state)
+    _save_meta(conversation_id, meta)
 
 
 async def get_settings_schema(extension_id: str) -> Dict[str, Any]:
@@ -137,23 +589,116 @@ async def get_runtime_options(
     settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     merged = _merge_runtime_settings(conversation_id or "", settings=settings)
+    state = _approval_state_for_conversation(conversation_id or "", merged)
+    approval_descriptor = _runtime_option_descriptor(
+        "approval_policy",
+        "Approval Policy",
+        approval_sm.runtime_options_for_state(state),
+        approval_sm.runtime_current_value(state),
+        approval_sm.POLICY_ALWAYS_REJECT,
+    )
+    approval_descriptor["footerLabel"] = "Approval"
+    approval_descriptor["accents"] = {
+        approval_sm.POLICY_ALWAYS_APPROVE: "ok",
+        approval_sm.POLICY_ALWAYS_REJECT: "err",
+        approval_sm.SETTING_ASK_CLEAR: "ok",
+    }
     return {
         "agent": extension_id,
-        "approval": _runtime_option_descriptor(
-            "approval_policy",
-            "Approval Policy",
-            _APPROVAL_POLICY_OPTIONS,
-            _normalize_approval_policy(merged),
-            _DEFAULT_APPROVAL_POLICY,
-        ),
-        "sandbox": _runtime_option_descriptor(
-            "sandbox_policy",
-            "Directory Trust",
-            _SANDBOX_POLICY_OPTIONS,
-            _normalize_sandbox_policy(merged),
-            _DEFAULT_SANDBOX_POLICY,
-        ),
+        "approval": approval_descriptor,
     }
+
+
+async def _handle_permission_request(
+    conversation_id: str,
+    session_id: str,
+    options: List[Any],
+    tool_call: Any,
+) -> RequestPermissionResponse:
+    normalized_options = _normalize_permission_options(options)
+    merged_settings = _merge_runtime_settings(conversation_id)
+    current_state = _approval_state_for_conversation(conversation_id, merged_settings)
+    automatic = _auto_permission_resolution(current_state, normalized_options)
+    if automatic is not None:
+        next_state = automatic.get("next_state")
+        if isinstance(next_state, dict):
+            _persist_approval_state(conversation_id, next_state)
+        response = automatic.get("response")
+        if isinstance(response, RequestPermissionResponse):
+            return response
+        return _cancelled_permission_response()
+
+    normalized_tool_call = _object_dict(tool_call)
+    tool_call_id = _tool_call_id(normalized_tool_call) or f"tool_{uuid.uuid4().hex[:10]}"
+    request_id = f"approval_{conversation_id[:8]}_{tool_call_id}"
+    descriptor = _build_permission_descriptor(
+        conversation_id,
+        session_id,
+        request_id,
+        normalized_tool_call,
+        normalized_options,
+        current_state,
+    )
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[object] = loop.create_future()
+    _pending_approvals[request_id] = future
+    _pending_request_specs[request_id] = {
+        "type": "permission",
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "tool_call_id": tool_call_id,
+        "options": [dict(item) for item in normalized_options],
+        "current_state": approval_sm.normalize_state(current_state),
+    }
+    _pending_approval_conversations[request_id] = conversation_id
+    _upsert_pending_approval(conversation_id, descriptor)
+    render_event = descriptor.get("render_event")
+    if callable(_broadcast_fn) and isinstance(render_event, dict):
+        await _broadcast_fn(render_event)
+    result = await future
+    if isinstance(result, dict):
+        next_state = result.get("next_state")
+        if isinstance(next_state, dict):
+            _persist_approval_state(conversation_id, next_state)
+        response = result.get("response")
+        if isinstance(response, RequestPermissionResponse):
+            return response
+    return _cancelled_permission_response()
+
+
+def resolve_approval(request_id: str, resolution: object) -> bool:
+    pending_future = _pending_approvals.pop(request_id, None)
+    request_spec = _pending_request_specs.pop(request_id, None)
+    _pending_approval_conversations.pop(request_id, None)
+    if isinstance(pending_future, asyncio.Future) and not pending_future.done():
+        result = _manual_permission_resolution(resolution, request_spec or {})
+        _persist_manual_permission_state(request_spec or {}, result)
+        pending_future.set_result(result)
+        return True
+    return False
+
+
+def validate_pending_approval(conversation_id: str, request_id: str, descriptor: Dict[str, Any]) -> bool:
+    if not isinstance(descriptor, dict):
+        return False
+    if request_id not in _pending_approvals:
+        return False
+    if _pending_approval_conversations.get(request_id) != conversation_id:
+        return False
+    transport = _transport
+    if transport is None:
+        return False
+    descriptor_thread_id = descriptor.get("thread_id")
+    current_session_id = transport.session_id_for(conversation_id)
+    if descriptor_thread_id and current_session_id and descriptor_thread_id != current_session_id:
+        return False
+    if descriptor_thread_id and not current_session_id:
+        return False
+    descriptor_runtime = descriptor.get("runtime_instance_id") or descriptor.get("runtime_signature")
+    current_runtime = transport.runtime_instance_id()
+    if descriptor_runtime and current_runtime and descriptor_runtime != current_runtime:
+        return False
+    return True
 
 
 async def list_models() -> List[Dict[str, Any]]:
@@ -197,7 +742,7 @@ async def warm_up_all_extensions(timeout: float = 60.0) -> Dict[str, bool]:
             transport.ensure_ready(
                 conversation_id="__gemini_acp_warmup__",
                 cwd=str(Path.home()),
-                approval_policy=_DEFAULT_APPROVAL_POLICY,
+                approval_policy="auto_deny",
             ),
             timeout=timeout,
         )
@@ -234,9 +779,11 @@ async def handle_message(
         return {"ok": False, "error": "conversation_id and text required"}
     merged_settings = _merge_runtime_settings(conversation_id, settings=settings)
     cwd = str(merged_settings.get("cwd") or Path.home())
-    approval_policy = _normalize_approval_policy(merged_settings)
+    approval_state = _approval_state_for_conversation(conversation_id, merged_settings)
+    approval_policy = approval_sm.setting_from_state(approval_state)
     debug_trace = bool(merged_settings.get("debug_trace"))
     meta = _load_meta(conversation_id)
+    meta[approval_sm.META_KEY] = approval_state
     existing_session_id = _bound_session_id(meta)
     turn_counter_raw = meta.get("gemini_acp_turn_counter")
     turn_counter = turn_counter_raw if isinstance(turn_counter_raw, int) else 0
@@ -271,6 +818,7 @@ async def handle_message(
             for event in events:
                 await _broadcast_fn(event)
 
+    _active_turn_ids[conversation_id] = turn_id
     try:
         prompt_result = await transport.send_prompt(
             conversation_id=conversation_id,
@@ -305,6 +853,8 @@ async def handle_message(
         meta["last_error"] = message
         _save_meta(conversation_id, meta)
         return {"ok": False, "error": str(exc), "restore_draft": True}
+    finally:
+        _active_turn_ids.pop(conversation_id, None)
 
     if not turn_accumulator.has_content():
         turn_accumulator.consume_batch_updates(prompt_result.updates)
@@ -333,6 +883,8 @@ async def handle_message(
     meta["gemini_acp_last_stop_reason"] = prompt_result.stop_reason
     meta["gemini_acp_last_user_message_id"] = prompt_result.user_message_id or user_message_id
     meta["status"] = "active"
+    current_approval_state = _approval_state_for_conversation(conversation_id, merged_settings)
+    meta[approval_sm.META_KEY] = approval_sm.after_turn_end(current_approval_state)
     _save_meta(conversation_id, meta)
 
     return {
@@ -432,6 +984,28 @@ async def hydrate_transcript(
         print(f"[GeminiACP] hydrate_transcript failed: {exc}")
         return []
     return build_history_transcript_entries(session_id=session_id, updates=updates)
+
+
+async def abort_session(conversation_id: str) -> bool:
+    transport = _transport
+    if transport is None:
+        return False
+    had_pending = any(cid == conversation_id for cid in _pending_approval_conversations.values())
+    _cancel_pending_approvals_for_conversation(conversation_id)
+    try:
+        cancelled = await transport.cancel_session(conversation_id)
+    except Exception as exc:
+        print(f"[GeminiACP] abort_session failed: {exc}")
+        return had_pending
+    return bool(cancelled or had_pending)
+
+
+async def compact_session(conversation_id: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "conversation_id": conversation_id,
+        "error": "Gemini ACP does not support compact",
+    }
 
 
 async def shutdown_client() -> None:
