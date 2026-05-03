@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from extensions.tool_card_contracts import build_tool_card_request, build_tool_card_response
@@ -21,6 +23,12 @@ _TOOL_STATE_KEYS = (
 )
 _TERMINAL_TOOL_STATUSES = {"completed", "failed"}
 _SUPPRESSED_TOOL_KINDS = {"think", "switch_mode"}
+_MAX_CAPTURED_TOOL_OUTPUT_LINES = 500
+_MAX_CAPTURED_TOOL_OUTPUT_BYTES = 20 * 1024
+_READ_LINES_SUMMARY_RE = re.compile(
+    r"^Read lines\s+(\d+)\s*-\s*(\d+)(?:\s+of\s+\d+)?\s+from\s+(.+)$",
+    re.IGNORECASE,
+)
 
 
 def utc_ts() -> str:
@@ -136,6 +144,37 @@ def _tool_contents_text(contents: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _read_summary_match(text: str) -> Optional[re.Match[str]]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    return _READ_LINES_SUMMARY_RE.match(stripped)
+
+
+def _read_summary_view_range(text: str) -> Optional[List[int]]:
+    match = _read_summary_match(text)
+    if match is None:
+        return None
+    start = _int_value(int(match.group(1)))
+    end = _int_value(int(match.group(2)))
+    if start is None or end is None:
+        return None
+    if start <= 0 or end < start:
+        return None
+    return [start, end]
+
+
+def _is_read_summary(text: str) -> bool:
+    return _read_summary_match(text) is not None
+
+
+def _truncate_to_byte_limit(text: str, byte_limit: int) -> Tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= byte_limit:
+        return text, False
+    return encoded[:byte_limit].decode("utf-8", errors="ignore"), True
+
+
 def _message_role_for_update(kind: str) -> Optional[str]:
     normalized = kind.strip()
     if normalized == "user_message_chunk":
@@ -231,6 +270,15 @@ def _tool_path_line(state: Dict[str, Any]) -> Tuple[str, Optional[int]]:
 
 
 def _tool_view_range(state: Dict[str, Any], line: Optional[int]) -> Optional[List[int]]:
+    explicit_range = _tool_explicit_view_range(state)
+    if explicit_range is not None:
+        return explicit_range
+    if isinstance(line, int) and line > 0:
+        return [line, line]
+    return None
+
+
+def _tool_explicit_view_range(state: Dict[str, Any]) -> Optional[List[int]]:
     raw_input = _tool_raw_input(state)
     raw_view_range = raw_input.get("view_range") or raw_input.get("viewRange")
     if isinstance(raw_view_range, list) and len(raw_view_range) == 2:
@@ -238,8 +286,9 @@ def _tool_view_range(state: Dict[str, Any], line: Optional[int]) -> Optional[Lis
         second = _int_value(raw_view_range[1])
         if first is not None and second is not None:
             return [first, second]
-    if isinstance(line, int) and line > 0:
-        return [line, line]
+    summary_range = _read_summary_view_range(_tool_contents_text(state.get("content")))
+    if summary_range is not None:
+        return summary_range
     return None
 
 
@@ -312,6 +361,173 @@ def _tool_output_text(state: Dict[str, Any]) -> str:
     if raw_output:
         return json.dumps(raw_output, indent=2, ensure_ascii=False)
     return ""
+
+
+def _capture_bounded_file_view(path: str, view_range: Optional[List[int]]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    target = Path(path)
+    try:
+        if not target.is_file():
+            return {}
+        start_line = 1
+        requested_end: Optional[int] = None
+        if isinstance(view_range, list) and len(view_range) == 2:
+            first = _int_value(view_range[0])
+            second = _int_value(view_range[1])
+            if first is not None and first > 0:
+                start_line = first
+            if second is not None and second >= start_line:
+                requested_end = second
+        max_end = start_line + _MAX_CAPTURED_TOOL_OUTPUT_LINES - 1
+        if requested_end is not None:
+            max_end = min(max_end, requested_end)
+
+        lines: List[Dict[str, Any]] = []
+        byte_count = 0
+        truncated = False
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                if line_no < start_line:
+                    continue
+                if line_no > max_end:
+                    truncated = requested_end is None or line_no <= requested_end
+                    break
+                newline_cost = 1 if lines else 0
+                remaining = _MAX_CAPTURED_TOOL_OUTPUT_BYTES - byte_count - newline_cost
+                if remaining <= 0:
+                    truncated = True
+                    break
+                line_text = raw_line.rstrip("\n")
+                captured_text, byte_truncated = _truncate_to_byte_limit(line_text, remaining)
+                lines.append({"line_no": line_no, "content": captured_text})
+                byte_count += newline_cost + len(captured_text.encode("utf-8"))
+                if byte_truncated:
+                    truncated = True
+                    break
+                if len(lines) >= _MAX_CAPTURED_TOOL_OUTPUT_LINES:
+                    truncated = requested_end is None or line_no < requested_end
+                    break
+    except OSError as exc:
+        return {"capture_error": f"{type(exc).__name__}: {exc}"}
+
+    if not lines:
+        return {}
+    content = "\n".join(_string_value(line.get("content")) for line in lines)
+    captured_range = [int(lines[0]["line_no"]), int(lines[-1]["line_no"])]
+    return {
+        "content": content,
+        "lines": lines,
+        "view_range": captured_range,
+        "truncated": truncated,
+    }
+
+
+def _capture_bounded_directory_listing(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    target = Path(path)
+    try:
+        if not target.is_dir():
+            return {}
+        entries = sorted(target.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        return {"capture_error": f"{type(exc).__name__}: {exc}"}
+
+    lines: List[str] = []
+    byte_count = 0
+    truncated = False
+    for entry in entries:
+        suffix = "/" if entry.is_dir() else ""
+        line_text = f"{entry.name}{suffix}"
+        newline_cost = 1 if lines else 0
+        remaining = _MAX_CAPTURED_TOOL_OUTPUT_BYTES - byte_count - newline_cost
+        if remaining <= 0 or len(lines) >= _MAX_CAPTURED_TOOL_OUTPUT_LINES:
+            truncated = True
+            break
+        captured_text, byte_truncated = _truncate_to_byte_limit(line_text, remaining)
+        lines.append(captured_text)
+        byte_count += newline_cost + len(captured_text.encode("utf-8"))
+        if byte_truncated:
+            truncated = True
+            break
+    return {
+        "content": "\n".join(lines),
+        "truncated": truncated or len(lines) < len(entries),
+    }
+
+
+def _normalized_view_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    path, line = _tool_path_line(state)
+    explicit_view_range = _tool_explicit_view_range(state)
+    view_range = explicit_view_range or _tool_view_range(state, line)
+    provider_output = _tool_output_text(state)
+    summary = provider_output if _is_read_summary(provider_output) else ""
+    content = provider_output
+    lines: Optional[List[Dict[str, Any]]] = None
+    capture_range = explicit_view_range
+    if capture_range is None and isinstance(line, int) and line > 0:
+        capture_range = [line, line + _MAX_CAPTURED_TOOL_OUTPUT_LINES - 1]
+    captured = (
+        _capture_bounded_file_view(path, capture_range)
+        if path and (not provider_output or summary)
+        else {}
+    )
+    captured_content = captured.get("content")
+    if isinstance(captured_content, str) and captured_content:
+        content = captured_content
+        captured_lines = captured.get("lines")
+        if isinstance(captured_lines, list):
+            lines = [dict(item) for item in captured_lines if isinstance(item, dict)]
+        captured_range = captured.get("view_range")
+        if isinstance(captured_range, list):
+            view_range = captured_range
+
+    payload: Dict[str, Any] = {
+        "title": _tool_title(state, "view"),
+        "path": path,
+        "content": content,
+    }
+    if isinstance(line, int):
+        payload["line"] = line
+    if view_range is not None:
+        payload["view_range"] = view_range
+    if lines is not None:
+        payload["lines"] = lines
+    if summary and summary != content:
+        payload["summary"] = summary
+    if "truncated" in captured:
+        payload["truncated"] = bool(captured.get("truncated"))
+    capture_error = _string_value(captured.get("capture_error"))
+    if capture_error:
+        payload["capture_error"] = capture_error
+    return payload
+
+
+def _normalized_search_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    path, _ = _tool_path_line(state)
+    mode, pattern = _search_mode_and_pattern(state)
+    content = _tool_output_text(state)
+    captured: Dict[str, Any] = {}
+    if not content and path:
+        captured = _capture_bounded_directory_listing(path)
+        captured_content = captured.get("content")
+        if isinstance(captured_content, str):
+            content = captured_content
+    payload: Dict[str, Any] = {
+        "title": "web search" if mode == "web_search" else _tool_title(state, "search"),
+        "mode": mode,
+        "path": path,
+        "pattern": pattern,
+        "arguments": _tool_raw_input(state),
+        "content": content,
+    }
+    if "truncated" in captured:
+        payload["truncated"] = bool(captured.get("truncated"))
+    capture_error = _string_value(captured.get("capture_error"))
+    if capture_error:
+        payload["capture_error"] = capture_error
+    return payload
 
 
 def _tool_command_output_parts(state: Dict[str, Any]) -> Tuple[str, str, int]:
@@ -473,38 +689,41 @@ def _tool_transcript_entries(turn_id: str, state: Dict[str, Any]) -> List[Dict[s
         return entries
 
     if tool_kind == "read":
-        view_range = _tool_view_range(state, line)
-        output_text = _tool_output_text(state)
+        normalized = _normalized_view_payload(state)
         entry = {
             "role": "view",
             "id": tool_call_id,
             "item_id": tool_call_id,
             "turn_id": turn_id,
-            "title": _tool_title(state, "view"),
-            "path": path,
-            "content": output_text,
+            "title": normalized.get("title"),
+            "path": normalized.get("path"),
+            "content": normalized.get("content"),
             "timestamp": utc_ts(),
         }
-        if view_range is not None:
-            entry["view_range"] = view_range
+        for key in ("line", "view_range", "lines", "summary", "truncated", "capture_error"):
+            if key in normalized:
+                entry[key] = normalized[key]
         entries.append(entry)
         return entries
 
     if tool_kind in {"search", "fetch"}:
-        mode, pattern = _search_mode_and_pattern(state)
+        normalized = _normalized_search_payload(state)
         entry = {
             "role": "search",
             "id": tool_call_id,
             "item_id": tool_call_id,
             "turn_id": turn_id,
-            "title": "web search" if mode == "web_search" else _tool_title(state, "search"),
-            "mode": mode,
-            "path": path,
-            "pattern": pattern,
-            "arguments": _tool_raw_input(state),
-            "content": _tool_output_text(state),
+            "title": normalized.get("title"),
+            "mode": normalized.get("mode"),
+            "path": normalized.get("path"),
+            "pattern": normalized.get("pattern"),
+            "arguments": normalized.get("arguments"),
+            "content": normalized.get("content"),
             "timestamp": utc_ts(),
         }
+        for key in ("truncated", "capture_error"):
+            if key in normalized:
+                entry[key] = normalized[key]
         entries.append(entry)
         return entries
 
@@ -602,37 +821,40 @@ def _command_live_events(conversation_id: str, turn_id: str, state: Dict[str, An
 
 
 def _view_live_event(conversation_id: str, turn_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    path, line = _tool_path_line(state)
-    view_range = _tool_view_range(state, line)
+    normalized = _normalized_view_payload(state)
     event: Dict[str, Any] = {
         "type": "view",
         "conversation_id": conversation_id,
         "turn_id": turn_id,
         "id": _tool_call_id(state),
-        "title": _tool_title(state, "view"),
-        "path": path,
-        "content": _tool_output_text(state),
+        "title": normalized.get("title"),
+        "path": normalized.get("path"),
+        "content": normalized.get("content"),
     }
-    if view_range is not None:
-        event["view_range"] = view_range
+    for key in ("line", "view_range", "lines", "summary", "truncated", "capture_error"):
+        if key in normalized:
+            event[key] = normalized[key]
     return event
 
 
 def _search_live_event(conversation_id: str, turn_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    path, _ = _tool_path_line(state)
-    mode, pattern = _search_mode_and_pattern(state)
-    return {
+    normalized = _normalized_search_payload(state)
+    event: Dict[str, Any] = {
         "type": "search",
         "conversation_id": conversation_id,
         "turn_id": turn_id,
         "id": _tool_call_id(state),
-        "title": "web search" if mode == "web_search" else _tool_title(state, "search"),
-        "mode": mode,
-        "path": path,
-        "pattern": pattern,
-        "arguments": _tool_raw_input(state),
-        "content": _tool_output_text(state),
+        "title": normalized.get("title"),
+        "mode": normalized.get("mode"),
+        "path": normalized.get("path"),
+        "pattern": normalized.get("pattern"),
+        "arguments": normalized.get("arguments"),
+        "content": normalized.get("content"),
     }
+    for key in ("truncated", "capture_error"):
+        if key in normalized:
+            event[key] = normalized[key]
+    return event
 
 
 def _generic_tool_begin_event(conversation_id: str, turn_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
