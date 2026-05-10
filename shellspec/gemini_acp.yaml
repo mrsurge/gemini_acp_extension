@@ -5,7 +5,7 @@ shells:
     pipe:
       mode: native_pipe_testing
     cwd: ${CWD}
-    subgroups: ["codex_agent", "acp", "gemini"]
+    subgroups: ["als-rs", "acp", "gemini"]
     inspect_hints:
       - json
       - jsonrpc
@@ -19,7 +19,7 @@ shells:
     pipe:
       mode: native_pipe_testing
     cwd: ${CWD}
-    subgroups: ["codex_agent", "acp", "gemini", "observed"]
+    subgroups: ["als-rs", "acp", "gemini", "observed"]
     inspect_hints:
       - json
       - jsonrpc
